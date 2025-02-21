@@ -229,9 +229,14 @@ def commit_changes(
     subject = commit_message(changes)
     if len(changes) > 1:
         body = "\n".join(changes)
-        message = subject + "\n\n" + body
     else:
         body = None
+        # move the changelog url from subject to body
+        if "\n" in subject:
+            subject, body = subject.split("\n", maxsplit=1)
+    if body:
+        message = subject + "\n\n" + body
+    else:
         message = subject
 
     # Remember the base branch
@@ -298,6 +303,7 @@ def commit_changes(
 
     if not (commit_to_base or branch_exists(branch)):
         check_call(["git", "checkout", "-b", branch])
+    log.debug("Commited with subject='%s', message='%s', body='%s'", subject, repr(message), repr(body))
     return CommittedChanges(
         subject=subject,
         body=body,
