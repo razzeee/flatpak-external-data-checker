@@ -303,7 +303,12 @@ def commit_changes(
 
     if not (commit_to_base or branch_exists(branch)):
         check_call(["git", "checkout", "-b", branch])
-    log.debug("Commited with subject='%s', message='%s', body='%s'", subject, repr(message), repr(body))
+    log.debug(
+        "committed with subject='%s', message='%s', body='%s'",
+        subject,
+        repr(message),
+        repr(body),
+    )
     return CommittedChanges(
         subject=subject,
         body=body,
