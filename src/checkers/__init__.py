@@ -8,7 +8,6 @@ import pkgutil
 import re
 import typing as t
 import zlib
-from string import Template
 from typing import TypeAlias, cast
 
 import aiohttp
@@ -40,7 +39,7 @@ from ..lib.externaldata import (
     ExternalState,
 )
 from ..lib.robots import RobotsCache
-from ..lib.version import LooseVersion
+from ..lib.templates import substitute_template, version_parts
 
 JSONType = str | int | float | bool | None | dict[str, t.Any] | list[t.Any]
 XMLElement: TypeAlias = ElementTree._Element
@@ -158,17 +157,7 @@ class Checker:
         """
         Parse version string and return a dict of named components.
         """
-        version_list = LooseVersion.split_components(version)
-        tmpl_vars = {"version": version}
-        for i, version_part in enumerate(version_list):
-            tmpl_vars[f"version{i}"] = version_part
-            if i == 0:
-                tmpl_vars["major"] = version_part
-            elif i == 1:
-                tmpl_vars["minor"] = version_part
-            elif i == 2:
-                tmpl_vars["patch"] = version_part
-        return tmpl_vars
+        return version_parts(version)
 
     @classmethod
     def _substitute_template(
@@ -176,11 +165,7 @@ class Checker:
         template_string: str,
         variables: dict[str, t.Any],
     ) -> str:
-        tmpl = Template(template_string)
-        try:
-            return tmpl.substitute(**variables)
-        except (KeyError, ValueError) as err:
-            raise CheckerMetadataError("Error substituting template") from err
+        return substitute_template(template_string, variables)
 
     @classmethod
     def _get_pattern(

@@ -35,9 +35,12 @@ from . import FILE_URL_SCHEMES, utils
 from .checksums import MultiDigest
 from .errors import (
     CheckerFetchError,
+    CheckerMetadataError,
     SourceLoadError,
     SourceUnsupported,
+    SourceUpdateError,
 )
+from .templates import substitute_template, version_parts
 
 _BM = t.TypeVar("_BM", bound="BuilderModule")
 _BS = t.TypeVar("_BS", bound="BuilderSource")
@@ -50,6 +53,10 @@ CHECKER_DATA_SCHEMA_COMMON = {
         "is-main-source": {"type": "boolean"},
         "is-important": {"type": "boolean"},
         "release-url-template": {"type": "string"},
+        "mirror-url-templates": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
         "arches": {
             "type": "array",
             "items": {"type": "string"},
@@ -381,11 +388,29 @@ class ExternalData(ExternalBase):
 
     def update(self):
         if self.new_version is not None:
-            self.source["url"] = self.new_version.url
-            self.new_version.checksum.update_source(self.source)
+            # Validate all changes before modifying the manifest source.
+            updated = self.source.copy()
+            updated["url"] = self.new_version.url
+            self.new_version.checksum.update_source(updated)
+            if "mirror-url-templates" in self.checker_data:
+                templates = self.checker_data["mirror-url-templates"]
+                if templates and self.new_version.version is None:
+                    raise SourceUpdateError(
+                        "mirror-url-templates requires a selected version"
+                    )
+                variables = version_parts(self.new_version.version or "")
+                try:
+                    mirrors = [substitute_template(t, variables) for t in templates]
+                    for mirror in mirrors:
+                        url = URL(mirror)
+                        if url.scheme not in FILE_URL_SCHEMES or not url.host:
+                            raise ValueError(f"Invalid mirror URL: {mirror}")
+                except (CheckerMetadataError, ValueError) as err:
+                    raise SourceUpdateError("Invalid mirror-url-templates") from err
+                updated["mirror-urls"] = mirrors
             if self.source["type"] == "extra-data":
                 assert self.new_version.size is not None
-                self.source["size"] = self.new_version.size
+                updated["size"] = self.new_version.size
             # Remove size property for non-extra-data sources
             elif "size" in self.source:
                 log.warning(
@@ -393,6 +418,10 @@ class ExternalData(ExternalBase):
                     self.filename,
                     self.source_path,
                 )
+                updated.pop("size", None)
+
+            self.source.update(updated)
+            if "size" not in updated:
                 self.source.pop("size", None)
 
     @property

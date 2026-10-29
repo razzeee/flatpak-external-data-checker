@@ -301,6 +301,37 @@ If the placeholder is immediately followed by an underscore, you need to add bra
 }
 ```
 
+#### Mirror URL templates
+
+For `archive`, `file`, and `extra-data` sources, opt in to updating `mirror-urls`
+by adding `mirror-url-templates` to `x-checker-data`:
+
+```json
+"x-checker-data": {
+    "type": "anitya",
+    "project-id": 123,
+    "url-template": "https://example.com/foo-$version.tar.gz",
+    "mirror-url-templates": [
+        "https://mirror.example.org/foo-$version.tar.gz",
+        "https://mirror.example.net/$major.$minor/foo-$version.tar.gz"
+    ]
+}
+```
+
+The list replaces the complete `mirror-urls` list when the source is updated.
+An empty list clears it. Templates use the [URL template syntax](#url-templates)
+above. The checker selects the version after applying any version constraints.
+The checker must supply a version
+for a nonempty list. Unknown placeholders, unavailable components, malformed
+templates, and URLs without a supported scheme and host fail the source update
+without changing its URL, checksums, size, or mirrors. Use `$$` for a literal `$`.
+
+Without this field, the checker leaves existing mirrors untouched. It also leaves
+sources with no update untouched. It does not infer replacements in existing URLs.
+The checker does not download or checksum-verify mirror URLs. Maintainers
+must ensure they serve the same bytes as the primary URL, whose checksums remain
+the source's checksums.
+
 ### Git checker
 
 To check for latest git tag in corresponding git source repo, add checker
