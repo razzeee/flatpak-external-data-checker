@@ -141,7 +141,6 @@ class AnityaChecker(Checker):
             branch=None,
             version=latest_version,
             timestamp=latest_timestamp,
-            changelog_url=None,
         ).fetch_remote()
 
         external_data.set_new_version(new_version)

@@ -171,6 +171,30 @@ and automatically add it to releases list in metainfo. To specify which source
 is the app upstream source, set property `is-main-source` to `true` in the
 checker metadata for that source.
 
+### Changelog links
+
+Add `changelog-url` to a source's `x-checker-data` to include a changelog link
+in console output, update commit bodies, and pull request bodies:
+
+```json
+"x-checker-data": {
+    "type": "pypi",
+    "name": "example",
+    "changelog-url": "https://example.org/changelog"
+}
+```
+
+This optional field works with file and Git sources. Its value must be a
+single-line string. Omit it or use an empty string to omit the link. The checker
+copies the URL literally, without fetching it or substituting `$version`.
+It also includes the link when repairing a source without a version change.
+
+The experimental name `changelog-url-template` remains a literal alias.
+If both keys are present, `changelog-url` takes precedence, including an empty
+string. Use `changelog-url` in new manifests. This field is separate from
+`release-url-template`, which supplies version-specific AppStream release URLs.
+The checker does not discover changelog URLs from PyPI metadata.
+
 ### Version constraining
 
 The checkers can support version constraining, making it possible to e.g. limit

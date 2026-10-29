@@ -56,7 +56,8 @@ CHECKER_DATA_SCHEMA_COMMON = {
         },
         "source-id": {"type": "string"},
         "parent-id": {"type": "string"},
-        "changelog-url-template": {"type": "string"},
+        "changelog-url": {"type": "string", "not": {"pattern": "[\r\n]"}},
+        "changelog-url-template": {"type": "string", "not": {"pattern": "[\r\n]"}},
     },
     "required": ["type"],
 }
@@ -207,7 +208,7 @@ class ExternalState(abc.ABC):
     url: str
     version: str | None
     timestamp: datetime.datetime | None
-    changelog_url: str | None
+    changelog_url: str | None = dataclasses.field(default=None, kw_only=True)
 
     def _replace(self: _ES, **kwargs) -> _ES:
         return dataclasses.replace(self, **kwargs)
@@ -290,7 +291,7 @@ class ExternalBase(BuilderSource):
                 )
                 self.state |= self.State.OUTDATED
 
-                assert new_version.changelog_url is None
+            if new_version.changelog_url is None:
                 new_version = new_version._replace(
                     changelog_url=self.current_version.changelog_url
                 )
@@ -365,7 +366,9 @@ class ExternalData(ExternalBase):
         checksum = MultiDigest.from_source(source)
         size = source.get("size")
         checker_data = source.get("x-checker-data", {})
-        changelog_url = checker_data.get("changelog-url-template", None)
+        changelog_url = checker_data.get(
+            "changelog-url", checker_data.get("changelog-url-template")
+        )
         arches = checker_data.get("arches") or source.get("only-arches") or ["x86_64"]
 
         obj = cls(
@@ -525,7 +528,9 @@ class ExternalGitRepo(ExternalBase):
         tag = source.get("tag")
         branch = source.get("branch")
         checker_data = source.get("x-checker-data", {})
-        changelog_url = checker_data.get("changelog-url-template", None)
+        changelog_url = checker_data.get(
+            "changelog-url", checker_data.get("changelog-url-template")
+        )
         arches = checker_data.get("arches") or source.get("only-arches") or ["x86_64"]
 
         obj = cls(

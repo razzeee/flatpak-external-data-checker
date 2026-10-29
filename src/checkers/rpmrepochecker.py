@@ -50,7 +50,6 @@ class RPMRepoChecker(Checker):
             timestamp=datetime.fromtimestamp(
                 int(child_prop("time", "file")), tz=timezone.utc
             ),
-            changelog_url=None,
         )
 
     async def check(self, external_data: ExternalBase):

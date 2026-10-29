@@ -64,13 +64,14 @@ def print_outdated_external_data(manifest_checker: manifest.ManifestChecker):
     ext_data = manifest_checker.get_outdated_external_data()
     for data in ext_data:
         state_txt = data.state.name or str(data.state)
-        message_tmpl = [
-            "{data_state}: {data_name}",
-            " Has a new version:",
-            "  URL:       {url}",
-        ]
+        message_tmpl = []
         message_args = {}
         if data.new_version:
+            message_tmpl = [
+                "{data_state}: {data_name}",
+                " Has a new version:",
+                "  URL:       {url}",
+            ]
             if data.type == data.Type.GIT:
                 assert data.new_version
                 message_tmpl += [
@@ -111,7 +112,7 @@ def print_outdated_external_data(manifest_checker: manifest.ManifestChecker):
             data_name=data.filename,
             **message_args,
         )
-        print(message, flush=True)
+        print(message + "\n" if message else "", flush=True)
     return len(ext_data)
 
 
@@ -228,10 +229,10 @@ def commit_changes(
     body: str | None
     subject = commit_message(changes)
     if len(changes) > 1:
-        body = "\n".join(changes)
+        separator = "\n\n" if any("\n" in change for change in changes) else "\n"
+        body = separator.join(changes)
     else:
         body = None
-        # move the changelog url from subject to body
         if "\n" in subject:
             subject, body = subject.split("\n", maxsplit=1)
     if body:

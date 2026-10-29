@@ -161,7 +161,6 @@ class DebianRepoChecker(Checker):
                         self.session,
                         robots_cache=self.robots_cache,
                     ),
-                    changelog_url=None,
                 )
             else:
                 try:
@@ -190,7 +189,6 @@ class DebianRepoChecker(Checker):
                     size=candidate.size,
                     version=candidate.version,
                     timestamp=await self._get_timestamp_for_candidate(candidate),
-                    changelog_url=None,
                 )
 
             external_data.set_new_version(new_version)

@@ -58,7 +58,6 @@ class JetBrainsChecker(Checker):
             timestamp=datetime.datetime.strptime(data["date"], "%Y-%m-%d").replace(
                 tzinfo=datetime.timezone.utc
             ),
-            changelog_url=None,
         )
 
         external_data.set_new_version(new_version)

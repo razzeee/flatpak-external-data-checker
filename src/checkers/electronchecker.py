@@ -80,7 +80,6 @@ class ElectronChecker(Checker):
             size=file_size,
             version=metadata["version"],
             timestamp=timestamp,
-            changelog_url=None,
         )
 
         await self._set_new_version(external_data, new_version)
