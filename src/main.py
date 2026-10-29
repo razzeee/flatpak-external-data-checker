@@ -98,7 +98,7 @@ def print_outdated_external_data(manifest_checker: manifest.ManifestChecker):
                 "  Version:   {version}",
                 "  Timestamp: {timestamp}",
             ]
-            if message_args["changelog_url"]:
+            if message_args.get("changelog_url"):
                 message_tmpl.append("  Changelog: {changelog_url}")
         elif data.State.BROKEN in data.state:
             message_tmpl = [
