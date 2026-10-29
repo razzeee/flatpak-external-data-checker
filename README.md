@@ -37,6 +37,31 @@ flatpak-external-data-checker MANIFEST_FILE
 
 it should display messages about any broken or outdated external data.
 
+### Verbose network diagnostics
+
+Run `flatpak-external-data-checker --verbose MANIFEST_FILE` (or `-v`) to
+include HTTP diagnostics from the shared aiohttp session. Each request has a
+session-local number, its origin, elapsed time, and its last observed stage
+with time since that stage. Events cover connection queuing, DNS/cache,
+connection creation/reuse, redirects, response headers, and request failures.
+Failures include the exception type and available connector host/port and OS
+error number; responses include status and the connected peer address when
+aiohttp still exposes the connection.
+
+These diagnostic lines omit URL credentials, paths, queries, fragments,
+headers, bodies, and exception messages to avoid exposing secrets. Other
+existing checker logs can include URLs; review the full output before sharing.
+
+The [public aiohttp trace API](https://docs.aiohttp.org/en/stable/tracing_reference.html)
+does not expose DNS result lists or individual IPv4/IPv6 connection attempts.
+The last observed stage is a clue, not proof of a particular failing address
+or address family. Connection creation can include DNS, TCP, TLS, and proxy
+negotiation; a peer may be a proxy. Redirect follow-up connection events retain
+the previous origin until new request headers are sent (DNS events report the
+host being resolved). Response-header completion is not body completion:
+later body/stream read failures are not covered by these trace hooks. No
+address selection, timeout, proxy, or retry behavior is changed.
+
 ### Installation
 
 This tool itself is available in Flatpak format from Flathub. Install with

@@ -47,6 +47,7 @@ from .lib.externaldata import (
     BuilderModule,
     ExternalBase,
 )
+from .lib.network import network_trace_configs
 from .lib.robots import RobotsCache
 from .lib.utils import asyncio_gather_failfast, dump_manifest, read_manifest
 
@@ -419,6 +420,7 @@ class ManifestChecker:
 
         counter = self.TasksCounter(total=len(external_data))
         async with aiohttp.ClientSession(
+            trace_configs=network_trace_configs(),
             raise_for_status=True,
             headers=HTTP_CLIENT_HEADERS,
             timeout=aiohttp.ClientTimeout(
