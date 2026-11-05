@@ -77,3 +77,16 @@ blocking native calls.
 
 Keep new tests offline. Use `tests/support.py` for a local HTTP server with a
 five-second request timeout.
+
+# PR history
+
+`src/lib/prhistory.py` reads metadata from trusted PR authors and caches it by
+repository and author IDs. Its first load scans all PRs. Later loads read PRs
+ordered by update time, with a one-minute overlap. Retargeting is visible because
+the scan covers all base branches. Records have no age cutoff.
+
+Cache refreshes hold a file lock and replace the JSON file atomically after
+validation. Failed refreshes leave the previous file intact. The reader exposes
+records without deciding which source updates to apply.
+
+Run `tests.test_pr_history` and `tests.test_pr_history_cache` for offline coverage.
