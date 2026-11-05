@@ -14,8 +14,9 @@ from pathlib import Path
 from github.Repository import Repository
 from requests.utils import parse_header_links
 
+from .externaldata import ExternalBase
 from .prmetadata import MARKER, MetadataError, parse_metadata
-from .updateidentity import canonical, entry_key
+from .updateidentity import Candidate, canonical, entry_key
 
 log = logging.getLogger(__name__)
 RETRY_LABEL = "external-data-checker:retry"
@@ -210,3 +211,101 @@ class PRHistory:
                     f"Cannot read PR {raw.get('html_url')}: {err}"
                 ) from err
         self.records = records
+
+    def select(
+        self, sources: list[ExternalBase], candidates: list[Candidate]
+    ) -> list[ExternalBase]:
+        blocked: set[int] = set()
+        for candidate in candidates:
+            for record in self.records:
+                if candidate.key not in record.entries:
+                    continue
+                rejected = record.state == "closed" and not record.retry
+                if rejected:
+                    blocked.add(id(candidate.data))
+                    log.info(
+                        "Deferring %s (%s): rejected in %s",
+                        candidate.data,
+                        candidate.entry["release"]["value"],
+                        record.url,
+                    )
+                    if (
+                        record.entries[candidate.key]["evidence"]
+                        != candidate.entry["evidence"]
+                    ):
+                        log.warning(
+                            "Artifact changed for rejected version of %s; "
+                            "use %s to retry",
+                            candidate.data,
+                            RETRY_LABEL,
+                        )
+
+        # Children may depend on the parent's new state, so skip the whole group.
+        def root(data: ExternalBase) -> int:
+            while data.parent:
+                data = data.parent
+            return id(data)
+
+        blocked_roots = {root(s) for s in sources if id(s) in blocked}
+        eligible = [
+            s
+            for s in sources
+            if s.new_version is not None and root(s) not in blocked_roots
+        ]
+        eligible_candidates = [
+            c for c in candidates if root(c.data) not in blocked_roots
+        ]
+        keys = {c.key for c in eligible_candidates}
+        # An unidentified source may already be in the open PR. Keep the whole
+        # proposal for exact-head lookup to avoid creating a duplicate source PR.
+        complete = len(eligible_candidates) == len(eligible)
+        keep_proposal = any(
+            r.state == "open"
+            and keys.intersection(r.entries)
+            and (not complete or not r.complete or set(r.entries) == keys)
+            for r in self.records
+        )
+        if not keep_proposal:
+            for candidate in eligible_candidates:
+                for record in self.records:
+                    if record.state == "open" and candidate.key in record.entries:
+                        blocked.add(id(candidate.data))
+                        blocked_roots.add(root(candidate.data))
+                        log.info(
+                            "Deferring %s: already proposed in %s",
+                            candidate.data,
+                            record.url,
+                        )
+        allowed = []
+        for data in sources:
+            if root(data) in blocked_roots:
+                if id(data) not in blocked and data.new_version is not None:
+                    log.info("Deferring %s with its source dependency group", data)
+            elif data.new_version is not None:
+                allowed.append(data)
+        return allowed
+
+    def retry_suffix(self, candidates: list[Candidate]) -> str:
+        keys = {c.key for c in candidates}
+        numbers = sorted(
+            {
+                r.number
+                for r in self.records
+                if r.state == "closed" and r.retry and keys.intersection(r.entries)
+            }
+        )
+        if not numbers:
+            return ""
+        digest = hashlib.sha256(canonical(numbers).encode()).hexdigest()[:12]
+        return f"-retry-{digest}"
+
+    def matching_open(self, candidates: list[Candidate]) -> Record | None:
+        keys = {c.key for c in candidates}
+        return next(
+            (
+                r
+                for r in self.records
+                if r.state == "open" and keys.intersection(r.entries)
+            ),
+            None,
+        )

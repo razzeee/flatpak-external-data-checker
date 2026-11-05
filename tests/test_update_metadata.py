@@ -43,6 +43,7 @@ class TestUpdateMetadata(UpdateFixture):
                 repo = MagicMock(id=42, default_branch="master", full_name="owner/app")
                 repo.owner.login = "owner"
                 repo.get_pulls.return_value = []
+                repo.requester.requestJsonAndCheck.return_value = ({}, [])
                 with (
                     patch.dict(os.environ, {"GITHUB_TOKEN": "secret"}),
                     patch("src.main.Github") as github,
@@ -53,7 +54,7 @@ class TestUpdateMetadata(UpdateFixture):
                 ):
                     github.return_value.get_repo.return_value = repo
                     publication = main.prepare_publication(
-                        checker, self.root, str(self.path)
+                        checker, self.root, str(self.path), [123]
                     )
                 checker.update_manifests()
                 change = main.CommittedChanges(

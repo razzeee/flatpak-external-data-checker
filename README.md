@@ -135,6 +135,12 @@ jobs:
           ref: ${{ matrix.branch }}
           persist-credentials: false
 
+      - uses: actions/cache@v4
+        with:
+          path: .fedc-pr-history
+          key: fedc-pr-history-${{ matrix.branch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fedc-pr-history-${{ matrix.branch }}-
+
       - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker:latest
         env:
           GIT_AUTHOR_NAME: Flatpak External Data Checker
@@ -144,7 +150,7 @@ jobs:
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --update --never-fork com.example.App.json
+          args: --update --never-fork --pr-author-id 41898282 --pr-history-cache .fedc-pr-history com.example.App.json
 ```
 
 In Settings, Actions, General, enable "Allow GitHub Actions to create and approve
@@ -169,14 +175,96 @@ only the built-in token. The checker does not dispatch CI itself.
 [personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 with access to the target repository.
 
-### Recorded update metadata
+### Skipping a rejected version
 
-Generated PRs include source and release identities in a hidden JSON comment.
-Keep that comment when editing the description. Give sources a unique
-`x-checker-data.source-id` to preserve their identity across file and module moves.
-The checker can infer IDs for unique Git, GitHub-release and rotating-URL sources.
-It logs a warning for sources it cannot identify and marks their PR metadata as
-incomplete. Recording this metadata does not change which updates are proposed.
+Close a generated PR without merging to skip its recorded source versions on
+later `--update` runs. Unrelated changes to the base branch or other sources do
+not reset this choice. If you reject A version 2 and B version 5, a later run
+can still propose B version 6 or A version 3.
+
+The checker records source IDs and versions in a hidden comment in the PR body.
+Keep that comment when editing the description. Each rejection applies to its
+repository, target branch, root manifest path, source and architecture restrictions.
+Renaming the manifest or branch changes that scope. Retargeted PRs need their
+metadata updated to match the new base branch before the checker can use them.
+
+Give each source a unique `x-checker-data.source-id`:
+
+```json
+"x-checker-data": {
+    "type": "rotating-url",
+    "url": "https://example.org/app/latest.tar.gz",
+    "pattern": ".*/app-([0-9.]+)\\.tar\\.gz",
+    "source-id": "app-archive"
+}
+```
+
+Keep the ID when reordering sources or moving them between files or modules under
+the same root manifest. Use separate IDs for architecture variants. Change the ID
+when replacing a source with a different upstream project. `--lint` rejects empty
+or duplicate IDs.
+
+The checker can infer IDs for unique Git, GitHub-release and rotating-URL sources
+from their configuration and location. Other sources need explicit IDs. The checker
+warns when it cannot identify a source. For those sources, it can only avoid
+duplicate PRs when the base and generated head branch match an existing PR.
+
+- Known file versions use the exact version string. Changing a checksum or URL
+  at a rejected version does not make it eligible again.
+- Git tags use the repository and exact tag, even if the tag moves. Moving Git
+  branches use full commits, so the next commit is eligible.
+- Files without a version use a SHA-256 checksum, or SHA-512 if SHA-256 is absent.
+  Changed bytes are eligible. Without either checksum, the checker cannot record
+  a rejection for an unknown version.
+- Merging a PR does not reject its versions. The checker still avoids reopening
+  a PR with the same base and head branch.
+
+The checker skips declared `parent-id` dependency groups together. It does not
+infer other build dependencies. Only allowed updates can change appdata, satisfy
+`--require-important-update`, or trigger automerge. A rejected update stays
+rejected even if the current download URL breaks.
+
+To retry, reopen the PR or add `external-data-checker:retry` to the closed PR and
+run the checker again. If several PRs rejected the same version, override each
+one. Removing the label restores that PR's rejections. Closing a replacement PR
+creates a new rejection. Retrying the same tree uses a new branch without
+overwriting the old one.
+
+The checker recognizes an open PR's recorded versions even if the generated tree
+changes. Refresh that PR manually when needed. If either proposal has sources
+without stable IDs, the checker keeps overlapping proposals together to avoid
+duplicate updates. Automerge still requires an exact head-branch match.
+
+By default, the checker trusts PRs from the authenticated user. Installation
+tokens require `--pr-author-id` with the bot's numeric GitHub user ID. For Actions'
+`GITHUB_TOKEN`, use `--pr-author-id 41898282` for `github-actions[bot]`. This option
+replaces the default. Repeat it to include previous bot IDs. Commit author names
+and email addresses do not identify the PR author.
+
+Old PRs without metadata keep the existing base/head matching behavior. The
+checker does not reconstruct their versions from titles.
+`--edit-only`, `--commit-only`, and `--commit-to-current-branch` skip GitHub history.
+When no updates remain, the checker writes no files or commits.
+`--check-outdated` still reports skipped versions as outdated.
+
+The first run reads the repository's full PR history, 100 PRs per request. Later
+runs refresh changed PRs before editing and before publication. Each refresh
+usually needs one request; more than 100 recent changes require more pages.
+Old rejections stay in the cache without an age cutoff. Runs with no identifiable
+candidates or no updates satisfying `--require-important-update` skip history.
+
+The cache defaults to `$XDG_CACHE_HOME/flatpak-external-data-checker`, or
+`~/.cache/flatpak-external-data-checker`. Set `--pr-history-cache` to use another
+directory. Restore and save this directory on CI runners, as in the workflow
+above. Add `.fedc-pr-history/` to `.gitignore` if you use that workflow. Without
+a restored cache, each run must read the full history again. A repository with
+2,000 PRs needs 20 requests for that initial scan, plus the publication refresh.
+Deleting or corrupting the cache triggers a full rebuild.
+
+Authentication errors, incomplete history and malformed trusted metadata stop
+publication. History reads and PR creation are separate requests, so a PR can
+close between them. Branch leases prevent concurrent runs from overwriting
+existing branches.
 
 ### Selectively submitting PRs
 

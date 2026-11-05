@@ -43,6 +43,7 @@ from requests.exceptions import RequestException
 from . import manifest
 from .lib.errors import ManifestLoadError
 from .lib.externaldata import ExternalData
+from .lib.prhistory import RETRY_LABEL, HistoryError, PRHistory
 from .lib.prmetadata import MetadataError, format_metadata
 from .lib.sourceupdates import format_source_updates
 from .lib.updateidentity import Candidate
@@ -340,8 +341,7 @@ AUTOMERGE_DUE_TO_BROKEN_URLS = (
 @dataclasses.dataclass
 class Publication:
     repository: Repository
-    base: str
-    manifest: str
+    history: PRHistory
     candidates: list[Candidate]
 
 
@@ -349,10 +349,12 @@ def prepare_publication(
     checker: manifest.ManifestChecker,
     checkout: Path,
     manifest_path: str,
+    author_ids: list[int],
+    cache_dir: Path | None = None,
 ) -> Publication:
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
-        raise MetadataError("GITHUB_TOKEN environment variable is not set")
+        raise HistoryError("GITHUB_TOKEN environment variable is not set")
     g = Github(token, per_page=100)
     origin = subprocess.check_output(
         ["git", "remote", "get-url", "origin"], text=True
@@ -362,8 +364,22 @@ def prepare_publication(
         ["git", "branch", "--show-current"], text=True
     ).strip()
     base = base or repo.default_branch
+    authors = set(author_ids)
+    if any(author <= 0 for author in authors):
+        raise HistoryError("--pr-author-id must be a positive GitHub user ID")
+    if not authors:
+        try:
+            authors.add(g.get_user().id)
+        except GithubException as err:
+            raise HistoryError(
+                "Cannot identify the PR author; set --pr-author-id to the numeric "
+                "GitHub ID of the generating bot (required for installation tokens)"
+            ) from err
     root = Path(manifest_path).resolve().relative_to(checkout.resolve()).as_posix()
     candidates = checker.get_update_candidates(checkout)
+    history = PRHistory(repo, base, root, authors, cache_dir=cache_dir)
+    if candidates:
+        history.load()
     # Reject invalid or oversized metadata before editing files.
     format_metadata(
         repo.id,
@@ -373,7 +389,7 @@ def prepare_publication(
         complete=len(candidates)
         == sum(d.new_version is not None for d in checker.get_external_data()),
     )
-    return Publication(repo, base, root, candidates)
+    return Publication(repo, history, candidates)
 
 
 def open_pr(
@@ -393,7 +409,20 @@ def open_pr(
     log.info("Opening pull request for branch %s", change.branch)
     if publication is not None:
         origin_repo = publication.repository
-        change = change._replace(base_branch=publication.base)
+        if publication.candidates:
+            publication.history.load()
+        assert manifest_checker is not None
+        applied = manifest_checker.get_applied_external_data()
+        applied_ids = {id(d) for d in applied}
+        candidates = [c for c in publication.candidates if id(c.data) in applied_ids]
+        still_allowed = publication.history.select(applied, candidates)
+        if {id(d) for d in still_allowed} != applied_ids:
+            log.error("PR history changed while preparing updates; rerun the checker")
+            return False
+        change = change._replace(
+            branch=change.branch + publication.history.retry_suffix(candidates),
+            base_branch=publication.history.base,
+        )
     else:
         g = Github(github_token)
         origin_url = (
@@ -444,7 +473,11 @@ def open_pr(
             data.type == data.Type.EXTRA_DATA
             and data.State.BROKEN in data.state
             and data.new_version
-            for data in manifest_checker.get_outdated_external_data()
+            for data in (
+                manifest_checker.get_applied_external_data()
+                if publication is not None
+                else manifest_checker.get_outdated_external_data()
+            )
         )
     )
 
@@ -486,17 +519,26 @@ def open_pr(
     )
     pr_message = "\n\n---\n\n".join(part for part in (pr_message, DISCLAIMER) if part)
     if publication is not None:
-        assert manifest_checker is not None
-        applied = manifest_checker.get_applied_external_data()
-        applied_ids = {id(d) for d in applied}
-        candidates = [c for c in publication.candidates if id(c.data) in applied_ids]
-        pr_message += "\n\n" + format_metadata(
-            origin_repo.id,
-            base,
-            publication.manifest,
-            [c.entry for c in candidates],
-            complete=len(candidates) == len(applied),
+        pr_message += (
+            "\n\nClosing this PR without merging skips its recorded source versions "
+            "on this target branch. Reopen it or add the "
+            f"`{RETRY_LABEL}` label to retry."
+            "\n\n"
+            + format_metadata(
+                origin_repo.id,
+                base,
+                publication.history.manifest,
+                [c.entry for c in candidates],
+                complete=len(candidates) == len(applied),
+            )
         )
+        unidentified = len(applied) - len(candidates)
+        if unidentified:
+            pr_message += (
+                f"\n\nThe checker cannot identify {unidentified} of these updates "
+                "and cannot skip them by version. See the checker logs; add unique "
+                "`x-checker-data.source-id` values where needed."
+            )
 
     prs = origin_repo.get_pulls(state="all", base=base, head=head)
 
@@ -537,6 +579,15 @@ def open_pr(
 
         return True
 
+    if publication is not None:
+        existing = publication.history.matching_open(candidates)
+        if existing is not None:
+            log.info(
+                "Versions already proposed in %s; refresh that PR manually",
+                existing.url,
+            )
+            return True
+
     # An empty lease requires the remote ref to be absent, even if another
     # writer creates it after the PR lookup.
     ref = f"refs/heads/{change.branch}"
@@ -554,6 +605,11 @@ def open_pr(
         check=False,
     )
     if push_result.returncode:
+        if publication is not None and any(
+            origin_repo.get_pulls(state="open", base=base, head=head)
+        ):
+            log.info("Another run published the PR for %s", head)
+            return True
         details = (push_result.stdout + push_result.stderr).replace(
             github_token, "<REDACTED>"
         )
@@ -587,13 +643,21 @@ def open_pr(
     if base != origin_repo.default_branch:
         subject = f"[{base}] {subject}"
 
-    pr = origin_repo.create_pull(
-        title=subject,
-        body=pr_message,
-        base=base,
-        head=head,
-        maintainer_can_modify=True,
-    )
+    try:
+        pr = origin_repo.create_pull(
+            title=subject,
+            body=pr_message,
+            base=base,
+            head=head,
+            maintainer_can_modify=True,
+        )
+    except GithubException as error:
+        if error.status == 422 and any(
+            origin_repo.get_pulls(state="open", base=base, head=head)
+        ):
+            log.info("Another run created the PR for %s", head)
+            return True
+        raise
     log.info("Opened pull request %s", pr.html_url)
     if pr_labels:
         log.info("Adding labels to PR: %s", ", ".join(pr_labels))
@@ -698,6 +762,21 @@ def parse_cli_args(cli_args=None):
         help="Comma-separated GitHub labels to add to the pull request",
     )
     parser.add_argument(
+        "--pr-history-cache",
+        type=Path,
+        default=Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        / "flatpak-external-data-checker",
+        help="PR history cache directory. Preserve it between CI runs.",
+    )
+    parser.add_argument(
+        "--pr-author-id",
+        type=int,
+        action="append",
+        default=[],
+        help="GitHub user ID whose PRs can reject versions. Repeat for multiple bots. "
+        "Defaults to the authenticated user. Required for installation tokens.",
+    )
+    parser.add_argument(
         "--commit-to-current-branch",
         action="store_true",
         help=(
@@ -762,6 +841,7 @@ async def run_with_args(args: argparse.Namespace) -> tuple[int, int, bool]:
 
     if should_update and outdated_num > 0:
         publication = None
+        allowed = None
         pr_mode = not (
             args.edit_only or args.commit_only or args.commit_to_current_branch
         )
@@ -771,17 +851,30 @@ async def run_with_args(args: argparse.Namespace) -> tuple[int, int, bool]:
             try:
                 with indir(git_checkout):
                     publication = prepare_publication(
-                        manifest_checker, git_checkout, args.manifest
+                        manifest_checker,
+                        git_checkout,
+                        args.manifest,
+                        args.pr_author_id,
+                        args.pr_history_cache,
                     )
+                allowed = publication.history.select(
+                    manifest_checker.get_external_data(),
+                    publication.candidates,
+                )
             except (
                 MetadataError,
+                HistoryError,
                 GithubException,
                 RequestException,
                 ValueError,
             ) as err:
-                log.error("Cannot prepare PR metadata; no updates written: %s", err)
+                log.error("Cannot read PR history; no updates written: %s", err)
                 return outdated_num, 1, False
-        changes = manifest_checker.update_manifests()
+        changes = (
+            manifest_checker.update_manifests(allowed)
+            if allowed is not None
+            else manifest_checker.update_manifests()
+        )
         if changes and not args.edit_only:
             git_checkout = get_manifest_git_checkout(args.manifest)
             ensure_git_safe_directory(git_checkout)
@@ -792,15 +885,25 @@ async def run_with_args(args: argparse.Namespace) -> tuple[int, int, bool]:
                 if not committed_changes:
                     return (-1, -1, False)
                 if not (args.commit_only or args.commit_to_current_branch):
-                    if not open_pr(
-                        committed_changes,
-                        manifest_checker=manifest_checker,
-                        fork=args.fork,
-                        pr_labels=args.pr_labels,
-                        publication=publication,
-                    ):
+                    try:
+                        published = open_pr(
+                            committed_changes,
+                            manifest_checker=manifest_checker,
+                            fork=args.fork,
+                            pr_labels=args.pr_labels,
+                            publication=publication,
+                        )
+                    except (
+                        MetadataError,
+                        HistoryError,
+                        GithubException,
+                        RequestException,
+                    ) as err:
+                        log.error("Cannot publish updates: %s", err)
                         return (-1, -1, False)
-        did_update = True
+                    if not published:
+                        return (-1, -1, False)
+        did_update = bool(changes)
 
     errors_num = print_errors(manifest_checker)
 

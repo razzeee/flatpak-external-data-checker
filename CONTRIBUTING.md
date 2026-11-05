@@ -87,6 +87,6 @@ the scan covers all base branches. Records have no age cutoff.
 
 Cache refreshes hold a file lock and replace the JSON file atomically after
 validation. Failed refreshes leave the previous file intact. The reader exposes
-records without deciding which source updates to apply.
+records; its `select` method applies rejection and open-PR rules to source updates.
 
 Run `tests.test_pr_history` and `tests.test_pr_history_cache` for offline coverage.
