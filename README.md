@@ -169,6 +169,15 @@ only the built-in token. The checker does not dispatch CI itself.
 [personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 with access to the target repository.
 
+### Recorded update metadata
+
+Generated PRs include source and release identities in a hidden JSON comment.
+Keep that comment when editing the description. Give sources a unique
+`x-checker-data.source-id` to preserve their identity across file and module moves.
+The checker can infer IDs for unique Git, GitHub-release and rotating-URL sources.
+It logs a warning for sources it cannot identify and marks their PR metadata as
+incomplete. Recording this metadata does not change which updates are proposed.
+
 ### Selectively submitting PRs
 
 The tool will by default open PRs if at least one source is updated. Alternatively, the tool can be configured to only open PRs if at least one "important" source is updated. This can avoid unwanted PRs, e.g. PRs that only update a single library.

@@ -1055,7 +1055,7 @@ class TestMain(unittest.IsolatedAsyncioTestCase):
             args.commit_only = False
             args.commit_to_current_branch = False
 
-            with patch("builtins.print"):
+            with patch("builtins.print"), patch("src.main.prepare_publication"):
                 result = await main.run_with_args(args)
 
         mock_open_pr.assert_called_once()

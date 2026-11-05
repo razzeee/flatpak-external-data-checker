@@ -25,6 +25,7 @@
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import getpass
 import json
 import logging
@@ -36,11 +37,15 @@ from enum import IntFlag
 from pathlib import Path
 
 from github import Github, GithubException
+from github.Repository import Repository
+from requests.exceptions import RequestException
 
 from . import manifest
 from .lib.errors import ManifestLoadError
 from .lib.externaldata import ExternalData
+from .lib.prmetadata import MetadataError, format_metadata
 from .lib.sourceupdates import format_source_updates
+from .lib.updateidentity import Candidate
 from .lib.utils import init_logging, parse_github_url
 from .lint import ManifestLinter
 
@@ -332,11 +337,51 @@ AUTOMERGE_DUE_TO_BROKEN_URLS = (
 )
 
 
+@dataclasses.dataclass
+class Publication:
+    repository: Repository
+    base: str
+    manifest: str
+    candidates: list[Candidate]
+
+
+def prepare_publication(
+    checker: manifest.ManifestChecker,
+    checkout: Path,
+    manifest_path: str,
+) -> Publication:
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise MetadataError("GITHUB_TOKEN environment variable is not set")
+    g = Github(token, per_page=100)
+    origin = subprocess.check_output(
+        ["git", "remote", "get-url", "origin"], text=True
+    ).strip()
+    repo = g.get_repo(parse_github_url(origin))
+    base = subprocess.check_output(
+        ["git", "branch", "--show-current"], text=True
+    ).strip()
+    base = base or repo.default_branch
+    root = Path(manifest_path).resolve().relative_to(checkout.resolve()).as_posix()
+    candidates = checker.get_update_candidates(checkout)
+    # Reject invalid or oversized metadata before editing files.
+    format_metadata(
+        repo.id,
+        base,
+        root,
+        [c.entry for c in candidates],
+        complete=len(candidates)
+        == sum(d.new_version is not None for d in checker.get_external_data()),
+    )
+    return Publication(repo, base, root, candidates)
+
+
 def open_pr(
     change: CommittedChanges,
     manifest_checker: manifest.ManifestChecker | None = None,
     fork: bool | None = None,
     pr_labels: list[str] | None = None,
+    publication: Publication | None = None,
 ) -> bool:
 
     try:
@@ -346,14 +391,17 @@ def open_pr(
         sys.exit(1)
 
     log.info("Opening pull request for branch %s", change.branch)
-    g = Github(github_token)
-
-    origin_url = (
-        subprocess.check_output(["git", "remote", "get-url", "origin"])
-        .decode("utf-8")
-        .strip()
-    )
-    origin_repo = g.get_repo(parse_github_url(origin_url))
+    if publication is not None:
+        origin_repo = publication.repository
+        change = change._replace(base_branch=publication.base)
+    else:
+        g = Github(github_token)
+        origin_url = (
+            subprocess.check_output(["git", "remote", "get-url", "origin"])
+            .decode("utf-8")
+            .strip()
+        )
+        origin_repo = g.get_repo(parse_github_url(origin_url))
 
     if fork is True:
         log.debug("creating fork (as requested)")
@@ -437,6 +485,18 @@ def open_pr(
         if part
     )
     pr_message = "\n\n---\n\n".join(part for part in (pr_message, DISCLAIMER) if part)
+    if publication is not None:
+        assert manifest_checker is not None
+        applied = manifest_checker.get_applied_external_data()
+        applied_ids = {id(d) for d in applied}
+        candidates = [c for c in publication.candidates if id(c.data) in applied_ids]
+        pr_message += "\n\n" + format_metadata(
+            origin_repo.id,
+            base,
+            publication.manifest,
+            [c.entry for c in candidates],
+            complete=len(candidates) == len(applied),
+        )
 
     prs = origin_repo.get_pulls(state="all", base=base, head=head)
 
@@ -701,6 +761,26 @@ async def run_with_args(args: argparse.Namespace) -> tuple[int, int, bool]:
     outdated_num = print_outdated_external_data(manifest_checker)
 
     if should_update and outdated_num > 0:
+        publication = None
+        pr_mode = not (
+            args.edit_only or args.commit_only or args.commit_to_current_branch
+        )
+        if pr_mode and manifest_checker.get_planned_updates():
+            git_checkout = get_manifest_git_checkout(args.manifest)
+            ensure_git_safe_directory(git_checkout)
+            try:
+                with indir(git_checkout):
+                    publication = prepare_publication(
+                        manifest_checker, git_checkout, args.manifest
+                    )
+            except (
+                MetadataError,
+                GithubException,
+                RequestException,
+                ValueError,
+            ) as err:
+                log.error("Cannot prepare PR metadata; no updates written: %s", err)
+                return outdated_num, 1, False
         changes = manifest_checker.update_manifests()
         if changes and not args.edit_only:
             git_checkout = get_manifest_git_checkout(args.manifest)
@@ -717,6 +797,7 @@ async def run_with_args(args: argparse.Namespace) -> tuple[int, int, bool]:
                         manifest_checker=manifest_checker,
                         fork=args.fork,
                         pr_labels=args.pr_labels,
+                        publication=publication,
                     ):
                         return (-1, -1, False)
         did_update = True

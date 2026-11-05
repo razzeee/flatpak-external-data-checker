@@ -118,6 +118,7 @@ class TestPublicationFailure(unittest.IsolatedAsyncioTestCase):
             patch("src.main.indir"),
             patch("src.main.commit_changes"),
             patch("src.main.open_pr", return_value=False),
+            patch("src.main.prepare_publication"),
         ):
             checker = factory.return_value
             checker.check = AsyncMock()

@@ -25,6 +25,7 @@ import os
 import typing as t
 from collections import OrderedDict
 from enum import IntEnum
+from pathlib import Path
 
 import aiohttp
 from lxml.etree import XMLSyntaxError
@@ -49,6 +50,7 @@ from .lib.externaldata import (
 )
 from .lib.robots import RobotsCache
 from .lib.sourceupdates import SourceUpdate
+from .lib.updateidentity import Candidate, build_candidates
 from .lib.utils import asyncio_gather_failfast, dump_manifest, read_manifest
 
 MAIN_SRC_PROP = "is-main-source"
@@ -502,6 +504,14 @@ class ManifestChecker:
             if data.State.BROKEN in data.state or data.new_version
         ]
 
+    def get_update_candidates(self, checkout: Path) -> list[Candidate]:
+        return build_candidates(
+            self.get_external_data(),
+            checkout,
+            self._root_manifest if isinstance(self._root_manifest, dict) else {},
+            [m for modules in self._modules.values() for m in modules],
+        )
+
     def _can_update(self, data: ExternalBase) -> bool:
         return data.new_version is not None and (
             self._allowed_updates is None or id(data) in self._allowed_updates
@@ -637,7 +647,6 @@ class ManifestChecker:
         changes: dict[str, t.Any]
         changes = OrderedDict()
         self.source_updates = []
-
         self._allowed_updates = {id(data) for data in self.get_planned_updates(allowed)}
         if not self._allowed_updates:
             log.info("No eligible source updates, not updating manifest")
