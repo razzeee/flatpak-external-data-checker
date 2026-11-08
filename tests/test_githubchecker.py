@@ -264,3 +264,69 @@ class TestGitHubChecker(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(source.new_version)
                 self.assertIsNone(source.new_release_url)
                 self.assertIsNone(source.new_version.timestamp)
+
+    async def test_explicit_tag_selects_published_prerelease(self):
+        for tag in ("latest", "preview/next #1"):
+            with self.subTest(tag=tag):
+                self.release.update(tag_name=tag, prerelease=True)
+                source = self.source({"tag": tag, "source-archive": "tarball"})
+                await self.checker.validate_checker_data(source)
+                await self.checker.check(source)
+                self.assertEqual(source.new_version.version, tag)
+        self.assertEqual(
+            self.fetch.await_args_list,
+            [
+                mock.call(f"https://api.github.com/repos/{REPO}/releases/tags/latest"),
+                mock.call(
+                    f"https://api.github.com/repos/{REPO}/releases/tags/preview%2Fnext%20%231"
+                ),
+            ],
+        )
+
+    async def test_explicit_tag_still_rejects_drafts_and_wrong_tags(self):
+        for change in ({"draft": True}, {"tag_name": "other"}):
+            with self.subTest(change=change):
+                self.fetch.return_value = RELEASE | change
+                with self.assertRaises(CheckerQueryError):
+                    await self.checker.check(
+                        self.source({"tag": TAG, "source-archive": "tarball"})
+                    )
+        self.download.assert_not_awaited()
+
+    async def test_explicit_tag_asset_keeps_release_metadata(self):
+        source = self.source(
+            {
+                "tag": TAG,
+                "tag-pattern": r"v(.+)",
+                "asset-name": "Linux.pulsar_${version}_amd64.deb",
+            }
+        )
+        await self.checker.validate_checker_data(source)
+        await self.checker.check(source)
+        self.fetch.assert_awaited_once_with(
+            f"https://api.github.com/repos/{REPO}/releases/tags/{TAG}"
+        )
+        self.assertEqual(source.new_version.version, "1.02.3")
+        self.assertEqual(source.new_release_url, PAGE)
+        self.assertEqual(
+            source.new_version.timestamp.isoformat(), "2026-11-04T12:00:00+00:00"
+        )
+
+    async def test_explicit_git_tag(self):
+        self.release.update(tag_name="latest", prerelease=True)
+        source = self.source({"tag": "latest"}, "git")
+        with mock.patch(
+            "src.lib.utils.git_ls_remote", return_value={"refs/tags/latest": "b" * 40}
+        ):
+            await self.checker.validate_checker_data(source)
+            await self.checker.check(source)
+        self.assertEqual(source.new_version.tag, "latest")
+        self.assertEqual(source.new_version.commit, "b" * 40)
+
+    async def test_invalid_explicit_tag(self):
+        for tag in ("", None, 123):
+            with self.subTest(tag=tag):
+                with self.assertRaises(CheckerMetadataError):
+                    await self.checker.validate_checker_data(
+                        self.source({"tag": tag, "asset-name": "app.zip"})
+                    )

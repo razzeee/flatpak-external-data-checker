@@ -466,7 +466,20 @@ For a `type: git` source, omit both artifact selectors. The checker updates its
 tag and commit to the release's tag. The source must use an HTTP or HTTPS GitHub
 URL for the same repository as `repo`. The URL may end in `.git`.
 
-Use the JSON checker if you need prereleases or custom release selection.
+To follow a specific tag, set `tag` in the source's `x-checker-data`:
+
+```yaml
+x-checker-data:
+  type: github
+  repo: example/project
+  tag: nightly
+  asset-name: project-linux.zip
+```
+
+`tag` is a literal release tag name, not a pattern. It accepts published
+prereleases, but not drafts. Omit it to follow the latest stable release.
+
+Use the JSON checker for other custom release selection.
 
 ### Forgejo releases checker
 

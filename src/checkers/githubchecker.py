@@ -25,6 +25,7 @@ class GitHubChecker(Checker):
                 "pattern": r"^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$",
             },
             "tag-pattern": {"type": "string", "format": "regex"},
+            "tag": {"type": "string", "minLength": 1},
             "asset-name": {"type": "string", "minLength": 1},
             "source-archive": {"enum": ["tarball", "zipball"]},
             "enable-robots-txt": {"type": "boolean"},
@@ -51,6 +52,12 @@ class GitHubChecker(Checker):
         repo = metadata["repo"]
         repository_url = f"https://github.com/{repo}"
         api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+        selected_tag = metadata.get("tag")
+        if selected_tag is not None:
+            tagged_api_url = github_release_api_url(repository_url, selected_tag)
+            if tagged_api_url is None:
+                raise CheckerMetadataError(f"{repo}: invalid release tag")
+            api_url = tagged_api_url
         if isinstance(external_data, ExternalGitRepo):
             source_api = github_release_api_url(
                 external_data.current_version.url, "HEAD"
@@ -65,12 +72,16 @@ class GitHubChecker(Checker):
         if (
             not isinstance(release, dict)
             or release.get("draft") is not False
-            or release.get("prerelease") is not False
+            or not isinstance(release.get("prerelease"), bool)
+            or (selected_tag is None and release["prerelease"])
         ):
-            raise CheckerQueryError(f"{repo}: expected a published stable release")
+            kind = "stable release" if selected_tag is None else "release"
+            raise CheckerQueryError(f"{repo}: expected a published {kind}")
         tag = release.get("tag_name")
         if not isinstance(tag, str) or not tag:
             raise CheckerQueryError(f"{repo}: release has no tag name")
+        if selected_tag is not None and tag != selected_tag:
+            raise CheckerQueryError(f"{repo}: expected release tag {selected_tag!r}")
         version = tag
         pattern = self._get_pattern(metadata, "tag-pattern")
         if pattern is not None:
@@ -78,8 +89,7 @@ class GitHubChecker(Checker):
             group = 1 if pattern.groups else 0
             if match is None or not match.group(group):
                 raise CheckerQueryError(
-                    f"{repo}: latest release tag {tag!r} "
-                    f"does not match {pattern.pattern!r}"
+                    f"{repo}: release tag {tag!r} does not match {pattern.pattern!r}"
                 )
             version = match.group(group)
         published_at = release.get("published_at")
