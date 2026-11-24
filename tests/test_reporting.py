@@ -144,6 +144,88 @@ class TestReporting(LocalHTTPTestCase):
         updated = json.loads(self.manifest.read_text())["sources"][0]
         self.assertEqual(updated["url"], entry["candidate"]["url"])
 
+    async def test_prepared_update_round_trip(self):
+        self.write([self.source()])
+        (self.root / "flathub.json").write_text('{"post-update-script":"generate"}')
+        hook = self.root / "generate"
+        hook.write_text(
+            "#!/usr/bin/env python3\nimport json, pathlib, subprocess, sys\n"
+            "source, = json.load(sys.stdin)['sources']\n"
+            "assert json.loads(pathlib.Path(sys.argv[1]).read_text())"
+            "['sources'][0]['url'] == source['candidate']['url']\n"
+            "pathlib.Path('vendored.json').write_text(source['selected_version'])\n"
+            "subprocess.run(['git','add','vendored.json'],check=True)\n"
+            "pathlib.Path('cache').touch()\n"
+        )
+        hook.chmod(0o755)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(self.root), *args])
+
+        git("init", "-qb", "main")
+        git("config", "user.name", "Tester")
+        git("config", "user.email", "test@example.com")
+        git("remote", "add", "origin", "https://github.com/example/app")
+        git("add", ".")
+        git("commit", "-qm", "base")
+        before = self.manifest.read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "handoff.json"
+            self.report = Path(tmp) / "report.json"
+            for options in (["--update"], ["--prepare-update", str(output)]):
+                _, report = await self.run_report(*options)
+                self.assertEqual(report["delivery"], "failed")
+                self.assertEqual(self.manifest.read_bytes(), before)
+                self.assertFalse(output.exists())
+            hook_before = hook.read_bytes()
+            hook.write_text("#!/bin/sh\nexit 7\n")
+            git("add", "generate")
+            git("commit", "-qm", "failing generator")
+            _, report = await self.run_report(
+                "--unsafe", "--prepare-update", str(output)
+            )
+            self.assertEqual(report["delivery"], "failed")
+            self.assertFalse(output.exists())
+            git("restore", "app.json")
+            hook.write_bytes(hook_before)
+            git("add", "generate")
+            git("commit", "-qm", "restore generator")
+            _, report = await self.run_report(
+                "--unsafe", "--prepare-update", str(output)
+            )
+            self.assertEqual(report["delivery"], "edited")
+            packet = json.loads(output.read_bytes())
+            self.assertEqual(set(packet["files"]), {"app.json", "vendored.json"})
+            git("reset", "--hard", "HEAD")
+            git("clean", "-fd")
+            with patch("src.main.open_pr", return_value=True) as publish:
+                _, report = await self.run_report("--publish-update", str(output))
+                self.assertEqual(report["delivery"], "pr_handled")
+                commit = publish.call_args.kwargs["prepared_commit"]
+                self.assertEqual(git("show", f"{commit}:vendored.json"), b"2")
+                self.assertEqual(git("status", "--porcelain"), b"")
+                change = publish.call_args.args[0]
+                self.assertEqual(
+                    change.commit,
+                    git("rev-parse", f"{commit}^{{tree}}").decode().strip(),
+                )
+                self.assertEqual(change.branch, f"update-main-{change.commit[:7]}")
+                for name, value in (
+                    (".github/workflows/run.yml", ["100644", ""]),
+                    (".gitmodules", ["100644", ""]),
+                    ("link", ["120000", ""]),
+                    ("submodule", ["160000", ""]),
+                    ("../escape", None),
+                ):
+                    output.write_text(json.dumps({**packet, "files": {name: value}}))
+                    _, report = await self.run_report("--publish-update", str(output))
+                    self.assertEqual(report["delivery"], "failed")
+                output.write_text(json.dumps(packet))
+                git("commit", "--allow-empty", "-qm", "moved")
+                _, report = await self.run_report("--publish-update", str(output))
+                self.assertEqual(report["delivery"], "failed")
+                publish.assert_called_once()
+
     async def test_checkout_identity_before_edits(self):
         self.write([self.source()])
 

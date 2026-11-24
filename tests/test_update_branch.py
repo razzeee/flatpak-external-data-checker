@@ -1,6 +1,7 @@
 import os
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src import main
@@ -21,7 +22,7 @@ class TestUpdateBranch(unittest.TestCase):
         self.repo.default_branch = "master"
         self.repo.get_pulls.return_value = []
 
-    def run_open_pr(self, returncode=0, stdout="", stderr=""):
+    def run_open_pr(self, returncode=0, stdout="", stderr="", **kwargs):
         with (
             patch.dict(os.environ, {"GITHUB_TOKEN": "test-secret"}),
             patch("src.main.Github") as github,
@@ -41,7 +42,7 @@ class TestUpdateBranch(unittest.TestCase):
             ) as run,
         ):
             github.return_value.get_repo.return_value = self.repo
-            result = main.open_pr(self.change, fork=False)
+            result = main.open_pr(self.change, fork=False, **kwargs)
         return result, run
 
     def test_new_branch(self):
@@ -78,6 +79,18 @@ class TestUpdateBranch(unittest.TestCase):
         self.assertIn("update-master-9416508", " ".join(logs.output))
         self.assertIn("inspect", " ".join(logs.output))
 
+    def test_prepared_push_uses_verified_base_and_prepared_commit(self):
+        sha = "a" * 40
+        with self.assertRaisesRegex(ValueError, "Target branch moved"):
+            self.run_open_pr(expected_base=sha, prepared_commit="b" * 40)
+        self.repo.create_pull.assert_not_called()
+        self.repo.get_branch.return_value.commit.sha = sha
+        _, run = self.run_open_pr(expected_base=sha, prepared_commit="b" * 40)
+        self.assertIn("--no-verify", run.call_args.args[0])
+        self.assertIn(
+            "b" * 40 + ":refs/heads/" + self.change.branch, run.call_args.args[0]
+        )
+
     def test_orphan_branch(self):
         self.check_collision("[rejected] (stale info)")
 
@@ -112,7 +125,7 @@ class TestPublicationFailure(unittest.IsolatedAsyncioTestCase):
         with (
             patch("src.main.manifest.ManifestChecker") as factory,
             patch("src.main.init_logging"),
-            patch("src.main.is_end_of_life", return_value=False),
+            patch("src.main.repository_config", return_value=(Path("/fake"), {})),
             patch("src.main.print_outdated_external_data", return_value=1),
             patch("src.main.get_manifest_git_checkout"),
             patch("src.main.ensure_git_safe_directory"),

@@ -184,6 +184,106 @@ with a secret containing a GitHub App installation token or personal access
 token with the required repository permissions. The `permissions` block controls
 only the built-in token.
 
+#### Regenerating files before the PR
+
+For updates that also need generated files, configure the app's `flathub.json`:
+
+```json
+{
+  "disable-external-data-checker": true,
+  "post-update-script": "tools/regenerate-sources"
+}
+```
+
+The executable runs once after FEDC edits a changed manifest, from the checkout
+root. Its first argument is the repository-relative manifest path. On stdin it
+receives `{"sources": [...]}` with the selected `update_available` entries from
+the [JSON report](#json-reports), including the source pointer and candidate
+version. Check these before running a source-specific generator. Tracked edits
+and deletions are included automatically; `git add` individual **new** output
+files to include them. A failed script fails preparation. An unchanged manifest
+produces no artifact. `--unsafe` alone never runs the script.
+
+Use two fresh runners. The first needs read access and any generator tools; the
+second needs write access and must use a trusted FEDC installation. Both check
+out the same named branch of the same repository. For example, on GitHub Actions:
+
+```yaml
+name: Regenerate Flatpak sources
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.result.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: master
+          path: app
+          persist-credentials: false
+      # Use a trusted image containing FEDC and your generator's dependencies.
+      - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker:latest
+        with:
+          args: --unsafe --prepare-update prepared.json app/com.example.App.json
+      - id: result
+        run: |
+          if test -f prepared.json; then echo 'changed=true' >> "$GITHUB_OUTPUT"; fi
+      - if: steps.result.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: prepared-update
+          path: prepared.json
+          if-no-files-found: error
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: master
+          path: app
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: prepared-update
+          path: handoff
+      - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker:latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_AUTHOR_NAME: Flatpak External Data Checker
+          GIT_COMMITTER_NAME: Flatpak External Data Checker
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        with:
+          args: --publish-update handoff/prepared.json --never-fork app/com.example.App.json
+```
+
+Use a reviewed image digest in production. The script has the preparation
+runner's privileges; run it only on trusted branches without write credentials
+or secrets. Download only the named artifact from this run, not from a PR or a
+previous run. Keep the artifact and any JSON report outside the app checkout.
+
+Publication checks the repository, branch, manifest and base commit. If the
+branch moved, prepare again. FEDC builds the final tree without checking out
+artifact files and uses its normal PR deduplication. Only regular files can
+change; changes to `.git*` paths (including `.github`), `flathub.json`,
+symlinks and submodule entries are refused. The handoff is limited to 1,024
+changes and 32 MiB.
+Prepared PRs can automerge only when explicitly enabled in the base branch's
+`flathub.json`; a handoff cannot request broken-source automerge.
+
 ### Automatically submitting PRs
 
 `--update` commits changes and opens a GitHub pull request. It requires a token in

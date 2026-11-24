@@ -205,12 +205,21 @@ class TestEntrypoint(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(value=value):
                 config.write_text(json.dumps({"end-of-life": value}))
-                self.assertEqual(main.is_end_of_life(nested_manifest), expected)
+                self.assertEqual(
+                    main.is_end_of_life(main.repository_config(nested_manifest)[1]),
+                    expected,
+                )
         config.unlink()
-        self.assertFalse(main.is_end_of_life(nested_manifest))
+        self.assertFalse(
+            main.is_end_of_life(main.repository_config(nested_manifest)[1])
+        )
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "flathub.json").write_text('{"end-of-life": "Retired"}')
-            self.assertTrue(main.is_end_of_life(Path(directory, "app.yml")))
+            self.assertTrue(
+                main.is_end_of_life(
+                    main.repository_config(Path(directory, "app.yml"))[1]
+                )
+            )
 
     async def test_runtime_branches(self):
         self._make_extension()

@@ -41,6 +41,7 @@ from pathlib import Path
 from github import Github, GithubException
 
 from . import manifest
+from .lib import prepared
 from .lib.errors import ManifestLoadError
 from .lib.externaldata import ExternalData
 from .lib.provenance import checker_provenance
@@ -160,7 +161,7 @@ def get_manifest_git_checkout(manifest: Path | str) -> Path:
     raise FileNotFoundError(f"Cannot find git checkout for {manifest}")
 
 
-def is_end_of_life(manifest_path: Path | str) -> bool:
+def repository_config(manifest_path: Path | str) -> tuple[Path, dict]:
     path = Path(manifest_path).resolve()
     try:
         directory = get_manifest_git_checkout(path)
@@ -168,10 +169,14 @@ def is_end_of_life(manifest_path: Path | str) -> bool:
         directory = path.parent
     config_path = directory / "flathub.json"
     if not config_path.exists():
-        return False
+        return directory, {}
     config = json.loads(config_path.read_text())
     if not isinstance(config, dict):
         raise ValueError("flathub.json must be an object")
+    return directory, config
+
+
+def is_end_of_life(config: dict) -> bool:
     return any(
         config.get(key) is not None and config.get(key) is not False
         for key in ("end-of-life", "end-of-life-rebase")
@@ -375,6 +380,10 @@ def open_pr(
     fork: bool | None = None,
     pr_labels: list[str] | None = None,
     report: dict | None = None,
+    *,
+    prepared_commit: str | None = None,
+    expected_base: str | None = None,
+    source_details: str = "",
 ) -> bool:
 
     try:
@@ -391,7 +400,15 @@ def open_pr(
         .decode("utf-8")
         .strip()
     )
-    origin_repo = g.get_repo(parse_github_url(origin_url))
+    origin_repo = g.get_repo(parse_github_url(origin_url).removesuffix(".git"))
+    if (
+        expected_base
+        and origin_repo.get_branch(
+            change.base_branch or origin_repo.default_branch
+        ).commit.sha
+        != expected_base
+    ):
+        raise ValueError("Target branch moved; prepare the update again")
 
     if fork is True:
         log.debug("creating fork (as requested)")
@@ -411,11 +428,8 @@ def open_pr(
     base = change.base_branch or origin_repo.default_branch
 
     head = f"{repo.owner.login}:{change.branch}"
-    source_details = (
-        format_source_updates(manifest_checker.source_updates)
-        if manifest_checker is not None
-        else ""
-    )
+    if manifest_checker is not None:
+        source_details = format_source_updates(manifest_checker.source_updates)
     try:
         with open("flathub.json") as f:
             repocfg = json.load(f)
@@ -427,9 +441,8 @@ def open_pr(
     force_automerge = (
         # …the user has not explicitly disabled automerge…
         automerge is not False
-        # …and we have a manifest checker (i.e. we're not in a test)…
-        and manifest_checker
         # …and at least one source is broken and has an update
+        and manifest_checker
         and any(
             data.type == data.Type.EXTRA_DATA
             and data.State.BROKEN in data.state
@@ -576,10 +589,11 @@ def open_pr(
         [
             "git",
             "push",
+            *(["--no-verify"] if prepared_commit else []),
             "--porcelain",
             f"--force-with-lease={ref}:",
             remote_url,
-            f"HEAD:{ref}",
+            f"{prepared_commit or 'HEAD'}:{ref}",
         ],
         capture_output=True,
         text=True,
@@ -751,7 +765,33 @@ def parse_cli_args(cli_args=None):
         help="Enable respecting robots.txt rules (default: False)",
     )
 
+    handoff = parser.add_mutually_exclusive_group()
+    handoff.add_argument(
+        "--prepare-update",
+        type=Path,
+        metavar="FILE",
+        help="Prepare updated files for publication in a separate checkout",
+    )
+    handoff.add_argument(
+        "--publish-update",
+        type=Path,
+        metavar="FILE",
+        help="Publish a prepared update without running repository code",
+    )
     args = parser.parse_args(cli_args)
+    if args.prepare_update or args.publish_update:
+        if (
+            args.lint
+            or args.update
+            or args.edit_only
+            or args.commit_only
+            or args.commit_to_current_branch
+        ):
+            parser.error(
+                "Prepared updates cannot be combined with other update modes or lint"
+            )
+        if args.publish_update and args.unsafe:
+            parser.error("--publish-update cannot be used with --unsafe")
     if args.lint and (
         args.update
         or args.commit_only
@@ -982,7 +1022,9 @@ async def run_runtime_branches(
                                     branch_args.manifest
                                 )
                                 branch_report["checkout"]["branch"] = branch
-                                if is_end_of_life(branch_args.manifest):
+                                if is_end_of_life(
+                                    repository_config(branch_args.manifest)[1]
+                                ):
                                     log.info("Skipping EOL runtime branch %s", branch)
                                     branch_report["status"] = "skipped"
                                     branch_report["skip_reason"] = "end-of-life"
@@ -1079,6 +1121,40 @@ async def run_runtime_branches(
         return 0, 1, False
 
 
+def publish_prepared(root, artifact, target, args, report):
+    tree, changes, details = prepared.load(root, artifact, target)
+    subject = commit_message(changes)
+    body = "\n".join(changes) if len(changes) > 1 else None
+    message = subject if not body else f"{subject}\n\n{body}"
+    commit = (
+        prepared.git(
+            root,
+            "commit-tree",
+            tree,
+            "-p",
+            target["base"],
+            "-F",
+            "-",
+            data=message.encode(),
+        )
+        .decode()
+        .strip()
+    )
+    base = target["branch"]
+    change = CommittedChanges(subject, body, tree, f"update-{base}-{tree[:7]}", base)
+    with indir(root):
+        if not open_pr(
+            change,
+            fork=args.fork,
+            pr_labels=args.pr_labels,
+            report=report,
+            prepared_commit=commit,
+            expected_base=target["base"],
+            source_details=details,
+        ):
+            raise ValueError("Prepared update publication failed")
+
+
 async def run_manifest_with_args(
     args: argparse.Namespace, report: dict, base_branch: str | None = None
 ) -> tuple[int, int, bool]:
@@ -1094,7 +1170,7 @@ async def run_manifest_with_args(
 
     if (
         base_branch is None
-        and not args.edit_only
+        and not (args.edit_only or args.prepare_update or args.publish_update)
         and not args.commit_to_current_branch
         and is_extension_manifest(args.manifest, args.max_manifest_size)
     ):
@@ -1103,7 +1179,8 @@ async def run_manifest_with_args(
             return result
 
     try:
-        if is_end_of_life(args.manifest):
+        root, config = repository_config(args.manifest)
+        if is_end_of_life(config):
             log.info("Skipping EOL manifest %s", args.manifest)
             report["status"] = "skipped"
             report["skip_reason"] = "end-of-life"
@@ -1113,7 +1190,26 @@ async def run_manifest_with_args(
         report["errors"].append({"type": type(error).__name__, "message": str(error)})
         return 0, 1, False
 
-    should_update = args.update or args.commit_only or args.edit_only
+    target = None
+    try:
+        if args.prepare_update or args.publish_update:
+            ensure_git_safe_directory(root)
+            target = prepared.identity(root, args.manifest)
+            artifact = args.prepare_update or args.publish_update
+            if artifact.resolve().is_relative_to(root):
+                raise ValueError("Keep the prepared update outside the app checkout")
+        if args.prepare_update and args.prepare_update.exists():
+            raise ValueError("Preparation destination already exists")
+        if args.publish_update and target:
+            publish_prepared(root, args.publish_update, target, args, report)
+            report["delivery"] = "pr_handled"
+            return 0, 0, True
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        return update_failed(report, error)
+
+    should_update = (
+        args.update or args.commit_only or args.edit_only or args.prepare_update
+    )
     did_update = False
 
     options = manifest.CheckerOptions(
@@ -1141,12 +1237,92 @@ async def run_manifest_with_args(
 
     outdated_num = print_outdated_external_data(manifest_checker)
     report["outdated"] = outdated_num
+    if args.prepare_update and manifest_checker.get_report_errors():
+        return update_failed(
+            report, ValueError("Source checks failed; update not prepared")
+        )
 
     if should_update and outdated_num > 0:
         report["delivery"] = "pending"
+        script = None
+        if "post-update-script" in config and (
+            manifest_checker.get_planned_updates()
+            or any(
+                s["status"] == "update_available"
+                for s in manifest_checker.get_submodule_report()
+            )
+        ):
+            if not (args.prepare_update and args.unsafe):
+                return update_failed(
+                    report,
+                    ValueError(
+                        "post-update-script requires --prepare-update and --unsafe"
+                    ),
+                )
+            try:
+                name = config["post-update-script"]
+                prepared.check_path(name)
+                script = root / name
+                if (
+                    script.resolve() != script
+                    or not script.is_file()
+                    or not os.access(script, os.X_OK)
+                ):
+                    raise ValueError(
+                        "post-update-script must be an executable file in the checkout"
+                    )
+            except (ValueError, OSError) as error:
+                return update_failed(report, error)
+        selected = (
+            [
+                source
+                for source in manifest_checker.get_source_report()
+                if source["status"] == "update_available"
+            ]
+            if script
+            else []
+        )
         changes = manifest_checker.update_manifests()
         report["delivery"] = "edited" if changes else "no_changes"
-        if changes and not args.edit_only:
+        if changes and args.prepare_update and target:
+            try:
+                if manifest_checker.get_errors():
+                    raise ValueError("Manifest update failed; update not prepared")
+                if script:
+                    name = script.relative_to(root)
+                    prepared.git(
+                        root,
+                        "--literal-pathspecs",
+                        "ls-files",
+                        "--error-unmatch",
+                        "--",
+                        name,
+                    )
+                    prepared.git(
+                        root,
+                        "--literal-pathspecs",
+                        "diff",
+                        "--quiet",
+                        target["base"],
+                        "--",
+                        name,
+                    )
+                    subprocess.run(
+                        [str(script), target["manifest"]],
+                        cwd=root,
+                        input=json.dumps({"sources": selected}).encode(),
+                        check=True,
+                    )
+                prepared.write(
+                    root,
+                    args.prepare_update,
+                    target,
+                    changes,
+                    format_source_updates(manifest_checker.source_updates),
+                )
+            except (ValueError, OSError, subprocess.CalledProcessError) as error:
+                return update_failed(report, error)
+        elif changes and not args.edit_only:
             report["delivery"] = "pending"
             git_checkout = get_manifest_git_checkout(args.manifest)
             ensure_git_safe_directory(git_checkout)
@@ -1201,6 +1377,13 @@ async def run_manifest_with_args(
     errors_num = print_errors(manifest_checker)
 
     return outdated_num, errors_num, did_update
+
+
+def update_failed(report: dict, error: Exception) -> tuple[int, int, bool]:
+    report["delivery"] = "failed"
+    report["errors"].append({"type": type(error).__name__, "message": str(error)})
+    log.error("%s", error)
+    return 0, 1, False
 
 
 class ResultCode(IntFlag):
