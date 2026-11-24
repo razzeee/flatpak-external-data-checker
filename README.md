@@ -195,8 +195,9 @@ For updates that also need generated files, configure the app's `flathub.json`:
 }
 ```
 
-The executable runs once after FEDC edits a changed manifest, from the checkout
-root. Its first argument is the repository-relative manifest path. On stdin it
+The executable runs from the checkout root once per manifest file whose sources
+FEDC updated, including referenced files. Its first argument is that file's
+repository-relative path. On stdin it
 receives `{"sources": [...]}` with the selected `update_available` entries from
 the [JSON report](#json-reports), including the source pointer and candidate
 version. Check these before running a source-specific generator. Tracked edits
@@ -230,7 +231,7 @@ jobs:
           path: app
           persist-credentials: false
       # Use a trusted image containing FEDC and your generator's dependencies.
-      - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker:latest
+      - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker@sha256:REVIEWED_PREPARE_IMAGE_DIGEST
         with:
           args: --unsafe --prepare-update prepared.json app/com.example.App.json
       - id: result
@@ -259,7 +260,7 @@ jobs:
         with:
           name: prepared-update
           path: handoff
-      - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker:latest
+      - uses: docker://ghcr.io/flathub-infra/flatpak-external-data-checker@sha256:REVIEWED_PUBLISH_IMAGE_DIGEST
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GIT_AUTHOR_NAME: Flatpak External Data Checker
@@ -270,7 +271,8 @@ jobs:
           args: --publish-update handoff/prepared.json --never-fork app/com.example.App.json
 ```
 
-Use a reviewed image digest in production. The script has the preparation
+Replace the digest placeholders with reviewed image digests. Use the same
+digest for both jobs if the generator needs no additional tools. The script has the preparation
 runner's privileges; run it only on trusted branches without write credentials
 or secrets. Download only the named artifact from this run, not from a PR or a
 previous run. Keep the artifact and any JSON report outside the app checkout.

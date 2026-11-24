@@ -697,6 +697,9 @@ class ManifestChecker:
 
     def get_source_report(self) -> list[dict[str, t.Any]]:
         """Snapshot detection results before update_manifests mutates sources."""
+        return list(self._source_records().values())
+
+    def _source_records(self) -> dict[int, dict[str, t.Any]]:
         planned = {id(data) for data in self._select_updates()}
 
         def find_pointer(node, target, pointer=""):
@@ -714,7 +717,7 @@ class ManifestChecker:
                     return found
             return None
 
-        results = []
+        results = {}
         for data in self.get_external_data():
             attempted = self._source_checks.get(id(data), [])
             reason = None
@@ -745,31 +748,27 @@ class ManifestChecker:
                 status = "checked"
             else:
                 status, reason = "unchecked", "no_candidate"
-            results.append(
-                {
-                    "manifest": os.path.relpath(
-                        data.source_path, self._root_manifest_dir
-                    ),
-                    "source_pointer": find_pointer(
-                        self._manifest_contents[data.source_path], data.source
-                    ),
-                    "module": str(data.module) if data.module else None,
-                    "type": data.type.value,
-                    "checker_type": data.checker_data.get("type"),
-                    "checkers_run": list(attempted),
-                    "status": status,
-                    "reason": reason,
-                    "state": data.state.name,
-                    "current": data.current_version.json,
-                    "candidate": data.new_version.json if data.new_version else None,
-                    "selected_version": data.selected_version,
-                    "update_group": data.checker_data.get("update-group"),
-                    "errors": [
-                        {"type": type(error).__name__, "message": str(error)}
-                        for error in self._source_errors.get(id(data), [])
-                    ],
-                }
-            )
+            results[id(data)] = {
+                "manifest": os.path.relpath(data.source_path, self._root_manifest_dir),
+                "source_pointer": find_pointer(
+                    self._manifest_contents[data.source_path], data.source
+                ),
+                "module": str(data.module) if data.module else None,
+                "type": data.type.value,
+                "checker_type": data.checker_data.get("type"),
+                "checkers_run": list(attempted),
+                "status": status,
+                "reason": reason,
+                "state": data.state.name,
+                "current": data.current_version.json,
+                "candidate": data.new_version.json if data.new_version else None,
+                "selected_version": data.selected_version,
+                "update_group": data.checker_data.get("update-group"),
+                "errors": [
+                    {"type": type(error).__name__, "message": str(error)}
+                    for error in self._source_errors.get(id(data), [])
+                ],
+            }
         return results
 
     def get_submodule_report(self) -> list[dict[str, t.Any]]:
@@ -972,6 +971,14 @@ class ManifestChecker:
                 raise AppdataLoadError from err
         else:
             log.debug("Version didn't change, not adding release")
+
+    def update_manifests_with_records(self) -> tuple[list[str], dict[str, list[dict]]]:
+        snapshots = self._source_records()
+        changes = self.update_manifests()
+        applied: dict[str, list[dict]] = {}
+        for data in self.get_applied_external_data():
+            applied.setdefault(str(data.source_path), []).append(snapshots[id(data)])
+        return changes, applied
 
     def update_manifests(self, allowed: list[ExternalBase] | None = None) -> list[str]:
         """Updates references to external data in manifests.

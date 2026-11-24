@@ -220,6 +220,32 @@ class CommittedChanges(t.NamedTuple):
     base_branch: str | None
 
 
+class UpdateDescription(t.NamedTuple):
+    subject: str
+    body: str | None
+
+    @classmethod
+    def from_changes(cls, changes: list[str]) -> "UpdateDescription":
+        return cls(
+            commit_message(changes), "\n".join(changes) if len(changes) > 1 else None
+        )
+
+    @property
+    def message(self) -> str:
+        return f"{self.subject}\n\n{self.body}" if self.body else self.subject
+
+    def committed(
+        self, tree: str, base: str | None, *, to_base: bool = False
+    ) -> CommittedChanges:
+        branch = (
+            base
+            if to_base
+            else (f"update-{base}-{tree[:7]}" if base else f"update-{tree[:7]}")
+        )
+        assert branch
+        return CommittedChanges(self.subject, self.body, tree, branch, base)
+
+
 def commit_message(changes: list[str]) -> str:
     assert len(changes) >= 1
 
@@ -265,14 +291,8 @@ def commit_changes(
     changes: list[str], commit_to_base: bool = False, base_branch: str | None = None
 ) -> CommittedChanges | None:
     log.info("Committing updates")
-    body: str | None
-    subject = commit_message(changes)
-    if len(changes) > 1:
-        body = "\n".join(changes)
-        message = subject + "\n\n" + body
-    else:
-        body = None
-        message = subject
+    description = UpdateDescription.from_changes(changes)
+    message = description.message
 
     # Remember the base branch
     if base_branch is None:
@@ -286,7 +306,6 @@ def commit_changes(
         if not base_branch:
             log.error("Failed to determine the base branch: cannot commit to it")
             return None
-        branch = base_branch
     else:
         # Moved to detached HEAD
         log.info("Switching to detached HEAD")
@@ -331,20 +350,10 @@ def commit_changes(
         ["git", "rev-parse", "HEAD^{tree}"], text=True
     ).strip()
 
-    if not commit_to_base:
-        branch = (
-            f"update-{base_branch}-{tree[:7]}" if base_branch else f"update-{tree[:7]}"
-        )
-
-    if not (commit_to_base or branch_exists(branch)):
-        check_call(["git", "checkout", "-b", branch])
-    return CommittedChanges(
-        subject=subject,
-        body=body,
-        commit=tree,
-        branch=branch,
-        base_branch=base_branch,
-    )
+    change = description.committed(tree, base_branch, to_base=commit_to_base)
+    if not (commit_to_base or branch_exists(change.branch)):
+        check_call(["git", "checkout", "-b", change.branch])
+    return change
 
 
 DISCLAIMER = (
@@ -550,7 +559,7 @@ def open_pr(
             }
         log.info("Found open PR: %s", pr.html_url)
 
-        if automerge or force_automerge:
+        if automerge is True or force_automerge:
             pr_commit = pr.head.repo.get_commit(pr.head.sha)
             if pr_commit.get_combined_status().state == "success" and pr.mergeable:
                 log.info("PR passed CI and is mergeable, merging %s", pr.html_url)
@@ -564,7 +573,7 @@ def open_pr(
                 try:
                     pr.create_issue_comment(
                         AUTOMERGE_DUE_TO_CONFIG
-                        if automerge
+                        if automerge is True
                         else AUTOMERGE_DUE_TO_BROKEN_URLS
                     )
                 except GithubException:
@@ -780,6 +789,9 @@ def parse_cli_args(cli_args=None):
     )
     args = parser.parse_args(cli_args)
     if args.prepare_update or args.publish_update:
+        artifact = args.prepare_update or args.publish_update
+        if args.report_json and Path(args.report_json).resolve() == artifact.resolve():
+            parser.error("--report-json must not name the prepared update file")
         if (
             args.lint
             or args.update
@@ -1123,9 +1135,7 @@ async def run_runtime_branches(
 
 def publish_prepared(root, artifact, target, args, report):
     tree, changes, details = prepared.load(root, artifact, target)
-    subject = commit_message(changes)
-    body = "\n".join(changes) if len(changes) > 1 else None
-    message = subject if not body else f"{subject}\n\n{body}"
+    description = UpdateDescription.from_changes(changes)
     commit = (
         prepared.git(
             root,
@@ -1135,13 +1145,12 @@ def publish_prepared(root, artifact, target, args, report):
             target["base"],
             "-F",
             "-",
-            data=message.encode(),
+            data=description.message.encode(),
         )
         .decode()
         .strip()
     )
-    base = target["branch"]
-    change = CommittedChanges(subject, body, tree, f"update-{base}-{tree[:7]}", base)
+    change = description.committed(tree, target["branch"])
     with indir(root):
         if not open_pr(
             change,
@@ -1273,16 +1282,11 @@ async def run_manifest_with_args(
                     )
             except (ValueError, OSError) as error:
                 return update_failed(report, error)
-        selected = (
-            [
-                source
-                for source in manifest_checker.get_source_report()
-                if source["status"] == "update_available"
-            ]
-            if script
-            else []
-        )
-        changes = manifest_checker.update_manifests()
+        if script:
+            changes, applied = manifest_checker.update_manifests_with_records()
+        else:
+            changes = manifest_checker.update_manifests()
+            applied = {}
         report["delivery"] = "edited" if changes else "no_changes"
         if changes and args.prepare_update and target:
             try:
@@ -1307,12 +1311,13 @@ async def run_manifest_with_args(
                         "--",
                         name,
                     )
-                    subprocess.run(
-                        [str(script), target["manifest"]],
-                        cwd=root,
-                        input=json.dumps({"sources": selected}).encode(),
-                        check=True,
-                    )
+                    for path, sources in applied.items():
+                        subprocess.run(
+                            [str(script), Path(path).relative_to(root)],
+                            cwd=root,
+                            input=json.dumps({"sources": sources}).encode(),
+                            check=True,
+                        )
                 prepared.write(
                     root,
                     args.prepare_update,

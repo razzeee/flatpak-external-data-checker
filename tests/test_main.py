@@ -1546,11 +1546,12 @@ class TestOpenPR(unittest.TestCase):
     @patch("subprocess.check_output", return_value=b"https://github.com/owner/repo\n")
     @patch("src.main.Github")
     def test_automerge_requires_status_and_mergeability(self, mock_github, mock_output):
-        for status, mergeable in (
-            ("pending", True),
-            ("failure", True),
-            ("success", False),
-            ("success", None),
+        for status, mergeable, setting in (
+            ("pending", True, True),
+            ("failure", True, True),
+            ("success", False, True),
+            ("success", None, True),
+            ("success", True, "false"),
         ):
             with (
                 self.subTest(status=status, mergeable=mergeable),
@@ -1558,7 +1559,7 @@ class TestOpenPR(unittest.TestCase):
                 patch(
                     "builtins.open",
                     unittest.mock.mock_open(
-                        read_data='{"automerge-flathubbot-prs": true}'
+                        read_data=json.dumps({"automerge-flathubbot-prs": setting})
                     ),
                 ),
             ):

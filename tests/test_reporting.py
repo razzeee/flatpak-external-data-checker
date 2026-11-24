@@ -145,7 +145,12 @@ class TestReporting(LocalHTTPTestCase):
         self.assertEqual(updated["url"], entry["candidate"]["url"])
 
     async def test_prepared_update_round_trip(self):
-        self.write([self.source()])
+        modules = ["first.json", "second.json"]
+        self.manifest.write_text(json.dumps({"id": "org.test.App", "modules": modules}))
+        for version, name in enumerate(modules, 2):
+            (self.root / name).write_text(
+                json.dumps({"name": name[:-5], "sources": [self.source(str(version))]})
+            )
         (self.root / "flathub.json").write_text('{"post-update-script":"generate"}')
         hook = self.root / "generate"
         hook.write_text(
@@ -153,8 +158,10 @@ class TestReporting(LocalHTTPTestCase):
             "source, = json.load(sys.stdin)['sources']\n"
             "assert json.loads(pathlib.Path(sys.argv[1]).read_text())"
             "['sources'][0]['url'] == source['candidate']['url']\n"
-            "pathlib.Path('vendored.json').write_text(source['selected_version'])\n"
-            "subprocess.run(['git','add','vendored.json'],check=True)\n"
+            "assert source['manifest'] == sys.argv[1]\n"
+            "output = pathlib.Path('vendored-' + sys.argv[1])\n"
+            "with output.open('x') as f: f.write(source['selected_version'])\n"
+            "subprocess.run(['git','add',str(output)],check=True)\n"
             "pathlib.Path('cache').touch()\n"
         )
         hook.chmod(0o755)
@@ -172,6 +179,22 @@ class TestReporting(LocalHTTPTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "handoff.json"
             self.report = Path(tmp) / "report.json"
+            for mode in ("--prepare-update", "--publish-update"):
+                alias = Path(tmp) / "alias"
+                alias.symlink_to(self.report)
+                with self.assertRaises(SystemExit) as rejected:
+                    main.parse_cli_args(
+                        [
+                            "--report-json",
+                            str(self.report),
+                            mode,
+                            str(alias),
+                            str(self.manifest),
+                        ]
+                    )
+                self.assertEqual(rejected.exception.code, 2)
+                self.assertFalse(self.report.exists())
+                alias.unlink()
             for options in (["--update"], ["--prepare-update", str(output)]):
                 _, report = await self.run_report(*options)
                 self.assertEqual(report["delivery"], "failed")
@@ -186,7 +209,7 @@ class TestReporting(LocalHTTPTestCase):
             )
             self.assertEqual(report["delivery"], "failed")
             self.assertFalse(output.exists())
-            git("restore", "app.json")
+            git("restore", *modules)
             hook.write_bytes(hook_before)
             git("add", "generate")
             git("commit", "-qm", "restore generator")
@@ -195,14 +218,19 @@ class TestReporting(LocalHTTPTestCase):
             )
             self.assertEqual(report["delivery"], "edited")
             packet = json.loads(output.read_bytes())
-            self.assertEqual(set(packet["files"]), {"app.json", "vendored.json"})
+            self.assertEqual(self.manifest.read_bytes(), before)
+            self.assertEqual(
+                set(packet["files"]),
+                {*modules, *("vendored-" + name for name in modules)},
+            )
             git("reset", "--hard", "HEAD")
             git("clean", "-fd")
             with patch("src.main.open_pr", return_value=True) as publish:
                 _, report = await self.run_report("--publish-update", str(output))
                 self.assertEqual(report["delivery"], "pr_handled")
                 commit = publish.call_args.kwargs["prepared_commit"]
-                self.assertEqual(git("show", f"{commit}:vendored.json"), b"2")
+                self.assertEqual(git("show", f"{commit}:vendored-first.json"), b"2")
+                self.assertEqual(git("show", f"{commit}:vendored-second.json"), b"3")
                 self.assertEqual(git("status", "--porcelain"), b"")
                 change = publish.call_args.args[0]
                 self.assertEqual(
