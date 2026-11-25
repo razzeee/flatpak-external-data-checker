@@ -989,22 +989,12 @@ class ManifestChecker:
                     source = replay
                     for step in pointer:
                         source = source[step]
-                    fields = {"url"}
-                    if data.type == data.Type.GIT:
-                        fields.update(("commit", "tag", "branch"))
-                    else:
-                        fields.update(
-                            k
-                            for k in ("md5", "sha1", "sha256", "sha512", "size")
-                            if k in source
-                        )
-                        if "mirror-url-templates" in data.checker_data:
-                            fields.add("mirror-urls")
-                    for field in fields:
-                        if field in old_source:
-                            source[field] = old_source[field]
-                        else:
-                            source.pop(field, None)
+                    original = ExternalBase.from_source(root, source, data.module)
+                    historic = ExternalBase.from_source(root, old_source, data.module)
+                    original.new_version = historic.current_version._replace(
+                        version=version if separator else None
+                    )
+                    original.update()
                 newer |= change is Change.NEWER
         return newer
 

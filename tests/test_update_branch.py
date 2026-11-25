@@ -152,6 +152,7 @@ class TestCloseSuperseded(PublicationFixture):
         self.repo.get_pulls.side_effect = [[], [self.old]]
         self.new = self.repo.create_pull.return_value
         self.new.number = 2
+        self.new.commits = 1
         self.new.user.id = 123
         self.new.base.ref = "master"
         self.new.head.sha = "b" * 40
@@ -221,6 +222,10 @@ class TestCloseSuperseded(PublicationFixture):
         self.repo.get_contents.return_value.size = 2
         self.repo.get_contents.return_value.encoding = "base64"
         self.repo.get_contents.return_value.decoded_content = b"{}\n"
+        self.repo.get_git_tree.return_value.truncated = False
+        self.repo.get_git_tree.return_value.tree = [
+            MagicMock(path="app.yaml", mode="100644")
+        ]
 
     def test_legacy_pr_across_unrelated_base_change(self):
         self.setup_legacy_pr()
@@ -273,6 +278,30 @@ class TestCloseSuperseded(PublicationFixture):
         self.old.commits = 2
         self.publish()
         self.old.edit.assert_not_called()
+
+    def test_marked_pr_with_extra_commit_is_kept(self):
+        self.old.commits = 2
+        self.publish()
+        self.old.edit.assert_not_called()
+
+    def test_legacy_pr_with_mode_change_is_kept(self):
+        self.setup_legacy_pr()
+        self.repo.get_git_tree.side_effect = [
+            MagicMock(truncated=False, tree=[MagicMock(path="app.yaml", mode=mode)])
+            for mode in ("100644", "100755")
+        ]
+        self.publish()
+        self.old.edit.assert_not_called()
+
+    def test_fallback_marker_fits_and_keeps_update_heading(self):
+        self.checker.pr_targets = {}
+        self.checker.source_updates = []
+        self.change = self.change._replace(body="a" * main.MAX_PR_BODY_LENGTH)
+        self.publish()
+        body = self.repo.create_pull.call_args.kwargs["body"]
+        self.assertTrue(body.startswith("### Updates"))
+        self.assertTrue(body.endswith(main.KEEP_OPEN))
+        self.assertEqual(len(body), main.MAX_PR_BODY_LENGTH)
 
 
 class TestPublicationFailure(unittest.IsolatedAsyncioTestCase):

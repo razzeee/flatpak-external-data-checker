@@ -469,6 +469,23 @@ def legacy_update_covered(
     return True
 
 
+def unchanged_file_modes(
+    repo: Repository, files: set[str], before: str, after: str
+) -> bool:
+    def modes(sha: str) -> dict[str, str]:
+        tree = repo.get_git_tree(sha, recursive=True)
+        if tree.truncated:
+            return {}
+        return {
+            entry.path: entry.mode
+            for entry in tree.tree
+            if entry.path in files and entry.mode in ("100644", "100755")
+        }
+
+    previous = modes(before)
+    return previous.keys() == files and previous == modes(after)
+
+
 def close_superseded(
     repo: Repository,
     replacement: PullRequest,
@@ -478,7 +495,12 @@ def close_superseded(
 ) -> None:
     for old in candidates:
         try:
-            if old.number == replacement.number or old.user.id != replacement.user.id:
+            if (
+                old.number == replacement.number
+                or old.user.id != replacement.user.id
+                or old.commits != 1
+                or replacement.commits != 1
+            ):
                 continue
             later_observation = old.created_at < checker.check_started
             body = old.body or ""
@@ -493,7 +515,7 @@ def close_superseded(
                 ):
                     continue
             else:
-                if DISCLAIMER not in body or old.commits != 1:
+                if DISCLAIMER not in body:
                     continue
                 commit = repo.get_commit(old.head.sha)
                 if (
@@ -511,6 +533,13 @@ def close_superseded(
                 ):
                     continue
                 previous_base = commit.parents[0].sha
+                if not unchanged_file_modes(
+                    repo,
+                    files,
+                    commit.parents[0].commit.tree.sha,
+                    commit.commit.tree.sha,
+                ):
+                    continue
                 if previous_base != parent and not all(
                     same_base_file(repo, path, previous_base, parent) for path in files
                 ):
@@ -818,7 +847,8 @@ def open_pr(
         if len(body) <= MAX_PR_BODY_LENGTH:
             pr_message = body
     if MARKER not in pr_message and manifest_checker is not None:
-        pr_message = f"{KEEP_OPEN}\n\n{pr_message}"
+        suffix = f"\n\n{KEEP_OPEN}"
+        pr_message = pr_message[: MAX_PR_BODY_LENGTH - len(suffix)] + suffix
 
     pr = origin_repo.create_pull(
         title=subject,

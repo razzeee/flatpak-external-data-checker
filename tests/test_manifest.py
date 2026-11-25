@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import aiohttp
 from lxml.etree import XMLSyntaxError
 
-from src import manifest
+from src import main, manifest
 from src.checkers.gitchecker import GitChecker
 from src.lib.checksums import MultiDigest
 from src.lib.errors import AppdataError
@@ -524,6 +524,52 @@ class TestManifest(unittest.IsolatedAsyncioTestCase):
                 {root.name}, messages, old, later_observation=False
             )
         )
+
+    def test_legacy_replay_uses_archive_size_rules(self):
+        root = Path(self.mf_path)
+        original = {
+            "name": "mod",
+            "sources": [
+                {
+                    "type": "archive",
+                    "size": 5,
+                    "url": "https://example.org/app.tar.gz",
+                    "sha256": "0" * 64,
+                }
+            ],
+        }
+        base = json.dumps(original, indent=4).encode()
+        root.write_bytes(base)
+        checker = manifest.ManifestChecker(self.mf_path)
+        checker._repository = root.parent
+        data = checker.get_external_data()[0]
+        data.new_version = data.current_version._replace(
+            version="3", checksum=MultiDigest(sha256="3" * 64)
+        )
+        checker.update_manifests()
+        original["sources"][0]["sha256"] = "2" * 64
+        del original["sources"][0]["size"]
+        for size in (None, 7):
+            if size:
+                original["sources"][0]["size"] = size
+            old = json.dumps(original, indent=4).encode()
+            repo = MagicMock()
+            repo.get_contents.side_effect = [
+                MagicMock(size=len(content), encoding="base64", decoded_content=content)
+                for content in (base, old)
+            ]
+            self.assertEqual(
+                main.legacy_update_covered(
+                    repo,
+                    checker,
+                    {root.name},
+                    ["mod: Update app.tar.gz to 2"],
+                    "parent",
+                    "head",
+                    True,
+                ),
+                size is None,
+            )
 
     def test_update_appdata_no_main_source(self):
         with open(self.mf_path, "w") as f:
