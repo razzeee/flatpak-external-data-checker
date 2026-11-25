@@ -203,9 +203,9 @@ on a later run.
 
 For older PRs without replacement metadata, the checker compares the original
 checker commit's update messages, manifest contents, and changed files.
-It keeps PRs open if
-coverage is uncertain, including partial architecture updates with identical
-commit messages, submodule updates, and PRs with additional commits.
+It keeps PRs open if it cannot reproduce the changes, including partial
+architecture updates with ambiguous commit messages. PRs with additional
+commits, submodule updates or pre-existing checkout changes stay open.
 
 ### Selectively submitting PRs
 

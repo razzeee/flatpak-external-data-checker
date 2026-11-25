@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -404,6 +405,48 @@ class TestManifest(unittest.IsolatedAsyncioTestCase):
                 {path.name}, legacy, historic, later_observation=True
             )
         )
+
+    def test_dirty_checkout_disables_replacement(self):
+        root = Path(self.mf_path)
+        root.write_text(
+            json.dumps(
+                {
+                    "name": "mod",
+                    "sources": [
+                        {
+                            "type": "file",
+                            "url": "https://example.org/archive",
+                            "sha256": "0" * 64,
+                        }
+                    ],
+                }
+            )
+        )
+        subprocess.run(["git", "init", "-q"], cwd=root.parent, check=True)
+        subprocess.run(["git", "add", root.name], cwd=root.parent, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+            cwd=root.parent,
+            check=True,
+        )
+        root.write_text(root.read_text() + "\n")
+        checker = manifest.ManifestChecker(self.mf_path)
+        checker.check_pr_checkout()
+        data = checker.get_external_data()[0]
+        data.new_version = data.current_version._replace(
+            version="2", checksum=MultiDigest(sha256="2" * 64)
+        )
+        self.assertTrue(checker.update_manifests())
+        self.assertEqual(checker.pr_targets, {})
 
     def test_source_updates_keep_each_architecture_and_respect_gate(self):
         with open(self.mf_path, "w") as f:

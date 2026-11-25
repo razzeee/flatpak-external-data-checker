@@ -147,7 +147,9 @@ class ManifestChecker:
         self._pr_targets: Targets = {}
         self._source_baselines: dict[int, str] = {}
         self._complete_pr_targets = True
+        self._clean_pr_checkout = True
         self._updated_appdata: str | None = None
+        self._appdata_source: ExternalBase | None = None
         self.check_started = datetime.datetime.now(datetime.timezone.utc)
         self._allowed_updates: set[int] | None = None
         self._blocked_update_sources: set[int] = set()
@@ -894,12 +896,38 @@ class ManifestChecker:
 
     @property
     def pr_targets(self) -> Targets:
-        return self._pr_targets if self._complete_pr_targets else {}
+        if (
+            not self._clean_pr_checkout
+            or not self._complete_pr_targets
+            or not self._repository
+        ):
+            return {}
+        if self._updated_appdata and self._appdata_source:
+            key = fingerprint(
+                "appstream",
+                self.root_manifest_file,
+                os.path.relpath(self._updated_appdata, self._repository),
+                self._source_baselines[id(self._appdata_source)],
+            )
+            return self._pr_targets | {key: Target("unknown", fingerprint("release"))}
+        return self._pr_targets
 
     @property
     def root_manifest_file(self) -> str:
         assert self._repository
         return os.path.relpath(self._root_manifest_path, self._repository)
+
+    def check_pr_checkout(self) -> None:
+        """git commit -am includes staged and unstaged work outside the checker."""
+        if self._repository:
+            status = subprocess.run(
+                git_command(
+                    self._repository, "status", "--porcelain", "--untracked-files=no"
+                ),
+                capture_output=True,
+                check=False,
+            )
+            self._clean_pr_checkout = status.returncode == 0 and not status.stdout
 
     def covers_legacy_update(
         self,
@@ -907,6 +935,7 @@ class ManifestChecker:
         messages: list[str],
         old_manifest,
         *,
+        replay=None,
         later_observation: bool,
     ) -> bool:
         """Legacy commit messages omit architectures. Cover every matching source."""
@@ -938,18 +967,13 @@ class ManifestChecker:
                     or data.new_version is None
                 ):
                     return False
-                old_source = old_manifest
-                for step in paths[id(data.source)]:
-                    if isinstance(old_source, dict) and step in old_source:
+                pointer = paths[id(data.source)]
+                try:
+                    old_source = old_manifest
+                    for step in pointer:
                         old_source = old_source[step]
-                    elif (
-                        isinstance(old_source, list)
-                        and isinstance(step, int)
-                        and step < len(old_source)
-                    ):
-                        old_source = old_source[step]
-                    else:
-                        return False
+                except (KeyError, IndexError, TypeError):
+                    return False
                 if not isinstance(old_source, dict):
                     return False
                 if fingerprint(old_source) == self._source_baselines.get(id(data)):
@@ -961,6 +985,26 @@ class ManifestChecker:
                 change = current.compare(previous, later_observation=later_observation)
                 if change is Change.INCOMPARABLE:
                     return False
+                if replay is not None:
+                    source = replay
+                    for step in pointer:
+                        source = source[step]
+                    fields = {"url"}
+                    if data.type == data.Type.GIT:
+                        fields.update(("commit", "tag", "branch"))
+                    else:
+                        fields.update(
+                            k
+                            for k in ("md5", "sha1", "sha256", "sha512", "size")
+                            if k in source
+                        )
+                        if "mirror-url-templates" in data.checker_data:
+                            fields.add("mirror-urls")
+                    for field in fields:
+                        if field in old_source:
+                            source[field] = old_source[field]
+                        else:
+                            source.pop(field, None)
                 newer |= change is Change.NEWER
         return newer
 
@@ -1075,14 +1119,7 @@ class ManifestChecker:
                     release_url=selected_data.new_release_url,
                 )
                 self._updated_appdata = appdata
-                if self._repository:
-                    key = fingerprint(
-                        "appstream",
-                        self.root_manifest_file,
-                        os.path.relpath(appdata, self._repository),
-                        str(selected_data),
-                    )
-                    self._pr_targets[key] = Target("unknown", fingerprint("release"))
+                self._appdata_source = selected_data
             except XMLSyntaxError as err:
                 raise AppdataLoadError from err
         else:
@@ -1103,6 +1140,7 @@ class ManifestChecker:
         self._source_baselines = {}
         self._complete_pr_targets = True
         self._updated_appdata = None
+        self._appdata_source = None
         planned = self.get_planned_updates(allowed)
         self._allowed_updates = {id(data) for data in planned}
         submodule_updates = (

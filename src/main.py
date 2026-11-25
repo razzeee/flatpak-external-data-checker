@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import datetime
 import getpass
+import io
 import json
 import logging
 import os
@@ -41,18 +42,22 @@ from pathlib import Path
 from github import Github, GithubException
 from github.PullRequest import PullRequest
 from github.Repository import Repository
+from lxml import etree
 
 from . import manifest
+from .lib.appdata import add_release
 from .lib.errors import ManifestLoadError
 from .lib.externaldata import ExternalData
 from .lib.provenance import checker_provenance
 from .lib.prreplacement import MARKER, replacement_marker, supersedes
 from .lib.runtime import RuntimeEolChecker
 from .lib.sourceupdates import format_source_updates
-from .lib.utils import init_logging, parse_github_url, read_manifest
+from .lib.utils import dump_manifest, init_logging, parse_github_url, read_manifest
 from .lint import ManifestLinter
 
 log = logging.getLogger(__name__)
+MAX_PR_BODY_LENGTH = 65536
+KEEP_OPEN = "<!-- fedc-keep-open -->"
 
 
 @contextlib.contextmanager
@@ -382,19 +387,86 @@ def same_base_file(repo: Repository, path: str, left: str, right: str) -> bool:
     )
 
 
-def previous_manifest(repo: Repository, checker: manifest.ManifestChecker, head: str):
-    blob = repo.get_contents(checker.root_manifest_file, ref=head)
-    if isinstance(blob, list) or blob.size > checker.opts.max_manifest_size:
+def file_at(repo: Repository, path: str, revision: str, limit: int) -> bytes | None:
+    blob = repo.get_contents(path, ref=revision)
+    if isinstance(blob, list) or blob.size > limit or blob.encoding != "base64":
         return None
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / Path(checker.root_manifest_file).name
+    return blob.decoded_content
+
+
+def legacy_update_covered(
+    repo: Repository,
+    checker: manifest.ManifestChecker,
+    files: set[str],
+    messages: list[str],
+    base: str,
+    head: str,
+    later_observation: bool,
+) -> bool:
+    root = checker.root_manifest_file
+    if root not in files or len(files) > 2:
+        return False
+    for filename in sorted(files, key=lambda name: name != root):
+        before = file_at(repo, filename, base, checker.opts.max_manifest_size)
+        after = file_at(repo, filename, head, checker.opts.max_manifest_size)
+        if before is None or after is None:
+            return False
         try:
-            path.write_bytes(blob.decoded_content)
-            contents = read_manifest(path)
+            if filename != root:
+                parser = etree.XMLParser(resolve_entities=False, load_dtd=False)
+                release = etree.fromstring(after, parser=parser).find(
+                    "releases/release"
+                )
+                if (
+                    release is None
+                    or not (version := release.get("version"))
+                    or not (date := release.get("date"))
+                ):
+                    return False
+                if not any(message.endswith(f" to {version}") for message in messages):
+                    return False
+                rendered = io.BytesIO()
+                add_release(
+                    io.BytesIO(before),
+                    rendered,
+                    version,
+                    date,
+                    None,
+                    release.findtext("url"),
+                )
+                if rendered.getvalue() != after:
+                    return False
+                continue
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / Path(root).name
+                path.write_bytes(after)
+                contents = read_manifest(path)
+                old = contents[0] if isinstance(contents, tuple) else contents
+                path.write_bytes(before)
+                contents = read_manifest(path)
+                replay, header = (
+                    contents if isinstance(contents, tuple) else (contents, False)
+                )
+                if not checker.covers_legacy_update(
+                    files,
+                    messages,
+                    old,
+                    replay=replay,
+                    later_observation=later_observation,
+                ):
+                    return False
+                dump_manifest(replay, path, header)
+                if path.read_bytes() != after:
+                    return False
         except Exception:
-            log.warning("Could not read previous manifest at %s", head, exc_info=True)
-            return None
-    return contents[0] if isinstance(contents, tuple) else contents
+            log.warning(
+                "Could not reproduce checker update %s at %s",
+                filename,
+                head,
+                exc_info=True,
+            )
+            return False
+    return True
 
 
 def close_superseded(
@@ -408,11 +480,10 @@ def close_superseded(
         try:
             if old.number == replacement.number or old.user.id != replacement.user.id:
                 continue
-            later_observation = (
-                old.number < replacement.number
-                and old.created_at < checker.check_started
-            )
+            later_observation = old.created_at < checker.check_started
             body = old.body or ""
+            if KEEP_OPEN in body:
+                continue
             if MARKER in body:
                 if not supersedes(
                     body,
@@ -444,9 +515,14 @@ def close_superseded(
                     same_base_file(repo, path, previous_base, parent) for path in files
                 ):
                     continue
-                previous = previous_manifest(repo, checker, old.head.sha)
-                if previous is None or not checker.covers_legacy_update(
-                    files, messages, previous, later_observation=later_observation
+                if not legacy_update_covered(
+                    repo,
+                    checker,
+                    files,
+                    messages,
+                    previous_base,
+                    old.head.sha,
+                    later_observation,
                 ):
                     continue
             current = repo.get_pull(old.number)
@@ -458,7 +534,7 @@ def close_superseded(
             ):
                 continue
             body = f"{body}\n\nSuperseded by {replacement.html_url}."
-            if len(body) <= 65536:
+            if len(body) <= MAX_PR_BODY_LENGTH:
                 current.edit(state="closed", body=body)
         except GithubException:
             log.warning(
@@ -739,8 +815,10 @@ def open_pr(
 
     if parent_sha:
         body = pr_message + "\n\n" + replacement_marker(head_sha, targets)
-        if len(body) <= 65536:  # GitHub's PR body limit
+        if len(body) <= MAX_PR_BODY_LENGTH:
             pr_message = body
+    if MARKER not in pr_message and manifest_checker is not None:
+        pr_message = f"{KEEP_OPEN}\n\n{pr_message}"
 
     pr = origin_repo.create_pull(
         title=subject,
@@ -1269,6 +1347,10 @@ async def run_manifest_with_args(
 
     if should_update and outdated_num > 0:
         report["delivery"] = "pending"
+        if args.update and not (
+            args.commit_only or args.edit_only or args.commit_to_current_branch
+        ):
+            manifest_checker.check_pr_checkout()
         changes = manifest_checker.update_manifests()
         report["delivery"] = "edited" if changes else "no_changes"
         if changes and not args.edit_only:

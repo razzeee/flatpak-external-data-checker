@@ -186,6 +186,15 @@ class TestCloseSuperseded(PublicationFixture):
         self.publish()
         self.old.edit.assert_not_called()
 
+    def test_existing_rotating_replacement_published_first(self):
+        self.old.number = 3
+        self.new.body = replacement_marker(self.new.head.sha, self.checker.pr_targets)
+        self.new.state = "open"
+        self.repo.get_pulls.side_effect = [[self.new], [self.old]]
+        self.publish()
+        self.assertEqual(self.old.edit.call_args.kwargs["state"], "closed")
+        self.repo.create_pull.assert_not_called()
+
     def test_push_failure_leaves_old_open(self):
         self.publish(1)
         self.old.edit.assert_not_called()
@@ -210,15 +219,36 @@ class TestCloseSuperseded(PublicationFixture):
         self.old.changed_files = 1
         self.repo.get_contents.return_value.sha = "f" * 40
         self.repo.get_contents.return_value.size = 2
-        self.repo.get_contents.return_value.decoded_content = b"{}"
+        self.repo.get_contents.return_value.encoding = "base64"
+        self.repo.get_contents.return_value.decoded_content = b"{}\n"
 
     def test_legacy_pr_across_unrelated_base_change(self):
         self.setup_legacy_pr()
         self.publish()
         self.checker.covers_legacy_update.assert_called_once_with(
-            {"app.yaml"}, ["foo: Update foo to 1.2"], {}, later_observation=True
+            {"app.yaml"},
+            ["foo: Update foo to 1.2"],
+            {},
+            replay={},
+            later_observation=True,
         )
         self.assertEqual(self.old.edit.call_args.kwargs["state"], "closed")
+
+    def test_dirty_update_cannot_be_adopted_as_legacy(self):
+        self.setup_legacy_pr()
+        self.old.body = f"{main.KEEP_OPEN}\n\n{main.DISCLAIMER}"
+        self.publish()
+        self.old.edit.assert_not_called()
+
+    def test_legacy_packaging_edit_is_not_covered(self):
+        self.setup_legacy_pr()
+        base = MagicMock(size=3, encoding="base64", decoded_content=b"{}\n")
+        head = MagicMock(
+            size=20, encoding="base64", decoded_content=b"buildsystem: simple\n"
+        )
+        self.repo.get_contents.side_effect = [base, base, base, head]
+        self.publish()
+        self.old.edit.assert_not_called()
 
     def test_later_publication_of_older_numeric_release(self):
         self.old.number = self.new.number + 1
