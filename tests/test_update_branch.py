@@ -4,6 +4,8 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src import main
+from src.lib.prreplacement import replacement_marker, supersedes
+from src.lib.sourceupdates import SourceUpdate
 
 
 class TestUpdateBranch(unittest.TestCase):
@@ -21,13 +23,20 @@ class TestUpdateBranch(unittest.TestCase):
         self.repo.default_branch = "master"
         self.repo.get_pulls.return_value = []
 
-    def run_open_pr(self, returncode=0, stdout="", stderr=""):
+    def run_open_pr(
+        self, returncode=0, stdout="", stderr="", checker=None, revision="a" * 40
+    ):
         with (
             patch.dict(os.environ, {"GITHUB_TOKEN": "test-secret"}),
             patch("src.main.Github") as github,
             patch("builtins.open", side_effect=FileNotFoundError),
             patch(
-                "subprocess.check_output", return_value=b"https://github.com/owner/repo"
+                "subprocess.check_output",
+                side_effect=lambda cmd, **kw: (
+                    f"{revision} {'c' * 40}"
+                    if "rev-list" in cmd
+                    else b"https://github.com/owner/repo"
+                ),
             ),
             patch(
                 "subprocess.check_call",
@@ -41,7 +50,7 @@ class TestUpdateBranch(unittest.TestCase):
             ) as run,
         ):
             github.return_value.get_repo.return_value = self.repo
-            result = main.open_pr(self.change, fork=False)
+            result = main.open_pr(self.change, checker, fork=False)
         return result, run
 
     def test_new_branch(self):
@@ -105,6 +114,67 @@ class TestUpdateBranch(unittest.TestCase):
             self.assertTrue(result)
             run.assert_not_called()
             self.repo.create_pull.assert_not_called()
+
+    def test_replacement_closes_only_covered_untouched_prs(self):
+        checker = MagicMock()
+        checker.source_updates = [SourceUpdate("foo", "1", "2", None)]
+        checker.pr_targets = {"foo": ("2", "1" * 64)}
+        self.run_open_pr(checker=checker)
+        body = self.repo.create_pull.call_args.kwargs["body"]
+        old = MagicMock(state="open", body=body)
+        old.head.repo = self.repo
+        old.head.ref = "update-master-1234567"
+        old.head.sha = "a" * 40
+        old.base.ref = "master"
+        old.user.id = self.repo.create_pull.return_value.user.id
+        self.repo.get_pull.return_value = old
+        for mismatch in (
+            "version",
+            "author",
+            "edited",
+            "missing",
+            "legacy",
+            "push",
+            None,
+        ):
+            with self.subTest(mismatch=mismatch):
+                old.body = "" if mismatch == "legacy" else body
+                old.head.sha = "d" * 40 if mismatch == "edited" else "a" * 40
+                old.user.id = (
+                    42
+                    if mismatch == "author"
+                    else self.repo.create_pull.return_value.user.id
+                )
+                checker.pr_targets = {
+                    "bar" if mismatch == "missing" else "foo": (
+                        "1" if mismatch == "version" else "10",
+                        "2" * 64,
+                    )
+                }
+                self.repo.get_pulls.side_effect = [[], [old]]
+                self.run_open_pr(
+                    int(mismatch == "push"), checker=checker, revision="b" * 40
+                )
+                if mismatch:
+                    old.edit.assert_not_called()
+                    old.create_issue_comment.assert_not_called()
+                else:
+                    old.edit.assert_called_once_with(state="closed")
+                    old.create_issue_comment.assert_called_once_with(
+                        f"Superseded by {self.repo.create_pull.return_value.html_url}."
+                    )
+
+    def test_replacement_must_cover_every_source(self):
+        first, second, head = "1" * 64, "2" * 64, "a" * 40
+        previous = {first: ("1.9", "a" * 64), second: ("unknown", "b" * 64)}
+        body = replacement_marker(head, previous)
+        newer = {first: ("1.10", "c" * 64)}
+        self.assertFalse(supersedes(body, head, previous))
+        self.assertFalse(supersedes(body, head, newer))
+        self.assertFalse(
+            supersedes(body, head, newer | {second: ("unknown", "d" * 64)})
+        )
+        self.assertTrue(supersedes(body, head, previous | newer))
 
 
 class TestPublicationFailure(unittest.IsolatedAsyncioTestCase):

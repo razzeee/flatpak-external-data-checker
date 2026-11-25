@@ -44,6 +44,7 @@ from . import manifest
 from .lib.errors import ManifestLoadError
 from .lib.externaldata import ExternalData
 from .lib.provenance import checker_provenance
+from .lib.prreplacement import Targets, fingerprint, replacement_marker, supersedes
 from .lib.runtime import RuntimeEolChecker
 from .lib.sourceupdates import format_source_updates
 from .lib.utils import init_logging, parse_github_url, read_manifest
@@ -514,6 +515,7 @@ def open_pr(
         return True
 
     open_prs = [pr for pr in prs if pr.state == "open"]
+    candidates = []
     if not open_prs:
         # Merging the base branch changes a PR's tree but not its branch name.
         update_branch = re.compile(rf"update-(?:{re.escape(base)}-)?[0-9a-f]{{7}}")
@@ -528,6 +530,8 @@ def open_pr(
             if pr_commit.commit.tree.sha == change.commit:
                 open_prs.append(pr)
                 break
+            if pr.body and "<!-- fedc-updates-v1 " in pr.body:
+                candidates.append(pr)
 
     for pr in open_prs:
         if report is not None:
@@ -619,6 +623,29 @@ def open_pr(
     if base != origin_repo.default_branch:
         subject = f"[{base}] {subject}"
 
+    targets: Targets = {}
+    if (
+        manifest_checker
+        and manifest_checker.pr_targets
+        and len(manifest_checker.pr_targets) == len(manifest_checker.source_updates)
+    ):
+        # Bind positional source IDs to the exact manifest revision they came from.
+        revision = subprocess.check_output(
+            ["git", "rev-list", "--parents", "-1", "HEAD"], text=True
+        ).split()
+        if len(revision) == 2:
+            original_head, parent = revision
+            scoped_targets = {
+                fingerprint(parent, key): target
+                for key, target in manifest_checker.pr_targets.items()
+            }
+            body = (
+                pr_message + "\n\n" + replacement_marker(original_head, scoped_targets)
+            )
+            if len(body) <= 65536:  # GitHub's PR body limit
+                pr_message = body
+                targets = scoped_targets
+
     pr = origin_repo.create_pull(
         title=subject,
         body=pr_message,
@@ -632,6 +659,28 @@ def open_pr(
     if pr_labels:
         log.info("Adding labels to PR: %s", ", ".join(pr_labels))
         pr.set_labels(*pr_labels)
+    for old in candidates:
+        if (
+            targets
+            and old.user.id == pr.user.id
+            and supersedes(old.body, old.head.sha, targets)
+        ):
+            try:
+                # A maintainer may have pushed or retargeted the PR during publication.
+                current = origin_repo.get_pull(old.number)
+                if (
+                    current.state != "open"
+                    or current.base.ref != base
+                    or current.head.sha != old.head.sha
+                    or current.body != old.body
+                ):
+                    continue
+                old.edit(state="closed")
+                old.create_issue_comment(f"Superseded by {pr.html_url}.")
+            except GithubException:
+                log.warning(
+                    "Could not finish superseding PR %s", old.html_url, exc_info=True
+                )
     return True
 
 

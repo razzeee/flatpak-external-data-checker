@@ -191,6 +191,13 @@ only the built-in token.
 [personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 with access to the target repository.
 
+After opening a replacement PR, the checker closes older PRs from the same
+account and head repository targeting the same base branch if the replacement
+covers every source update and advances at least one numeric release version.
+It links to the replacement and keeps the old branch. PRs based on a different
+commit, PRs with additional commits, and PRs without the checker's replacement
+metadata (including submodule updates) stay open.
+
 ### Selectively submitting PRs
 
 By default, the tool opens a PR whenever a source has an update. To avoid PRs

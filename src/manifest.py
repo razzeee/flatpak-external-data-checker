@@ -52,6 +52,7 @@ from .lib.externaldata import (
     BuilderModule,
     ExternalBase,
 )
+from .lib.prreplacement import Targets, fingerprint, release_version
 from .lib.robots import RobotsCache
 from .lib.sourceupdates import SourceUpdate
 from .lib.submodules import (
@@ -132,6 +133,7 @@ class ManifestChecker:
         self._errors: list[Exception]
         self._errors = []
         self.source_updates: list[SourceUpdate] = []
+        self.pr_targets: Targets = {}
         self._allowed_updates: set[int] | None = None
         self._blocked_update_sources: set[int] = set()
         self._source_checks: dict[int, list[str]] = {}
@@ -877,7 +879,7 @@ class ManifestChecker:
 
     def _update_manifest(self, path, datas, changes):
         path_has_changes = False
-        for data in datas:
+        for index, data in enumerate(datas):
             if not self._can_update(data):
                 continue
 
@@ -886,6 +888,17 @@ class ManifestChecker:
             data_new_ver_version = data.new_version.version
 
             source_update = SourceUpdate.from_source(data)
+            if self._repository:
+                key = fingerprint(
+                    os.path.relpath(self._root_manifest_path, self._repository),
+                    os.path.relpath(path, self._repository),
+                    index,
+                    source_update.source,
+                )
+                self.pr_targets[key] = (
+                    release_version(data_new_ver_version),
+                    fingerprint(data.new_version.json),
+                )
             data.update()
             self.source_updates.append(source_update)
             if data_new_ver_version is not None:
@@ -989,6 +1002,7 @@ class ManifestChecker:
         changes: dict[str, t.Any]
         changes = OrderedDict()
         self.source_updates = []
+        self.pr_targets = {}
         planned = self.get_planned_updates(allowed)
         self._allowed_updates = {id(data) for data in planned}
         submodule_updates = (
