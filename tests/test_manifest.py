@@ -380,14 +380,30 @@ class TestManifest(unittest.IsolatedAsyncioTestCase):
         head = "a" * 40
         previous = observe(["b", "c"])
         body = replacement_marker(head, previous.pr_targets)
-        Path(path.parent, "README.md").write_text("Other changes")
+        historic = json.loads(path.read_text())
+        original = json.dumps(
+            json.loads(original) | {"build-options": {"env": {"A": "B"}}}
+        )
         current = observe(["b", "d"])
         self.assertTrue(supersedes(body, head, current.pr_targets))
         legacy = ["scanner: Update scanner.tgz"]
-        self.assertTrue(current.covers_legacy_update({path.name}, legacy))
+        self.assertTrue(
+            current.covers_legacy_update(
+                {path.name}, legacy, historic, later_observation=True
+            )
+        )
+        self.assertFalse(
+            previous.covers_legacy_update(
+                {path.name}, legacy, historic, later_observation=True
+            )
+        )
         partial = observe(["d"])
         self.assertFalse(supersedes(body, head, partial.pr_targets))
-        self.assertFalse(partial.covers_legacy_update({path.name}, legacy))
+        self.assertFalse(
+            partial.covers_legacy_update(
+                {path.name}, legacy, historic, later_observation=True
+            )
+        )
 
     def test_source_updates_keep_each_architecture_and_respect_gate(self):
         with open(self.mf_path, "w") as f:
@@ -423,6 +439,48 @@ class TestManifest(unittest.IsolatedAsyncioTestCase):
         data.current_version = data.new_version
         self.assertEqual(checker.update_manifests(), [])
         self.assertEqual(checker.source_updates, [])
+
+    def test_legacy_numeric_update_can_retain_one_target(self):
+        root = Path(self.mf_path)
+        original = {
+            "name": "mod",
+            "sources": [
+                {
+                    "type": "file",
+                    "url": f"https://example.org/{name}",
+                    "sha256": "0" * 64,
+                }
+                for name in ("one", "two")
+            ],
+        }
+
+        def observe(versions):
+            root.write_text(json.dumps(original))
+            checker = manifest.ManifestChecker(self.mf_path)
+            checker._repository = root.parent
+            for data, version in zip(
+                checker.get_external_data(), versions, strict=True
+            ):
+                data.new_version = data.current_version._replace(
+                    version=version, checksum=MultiDigest(sha256=version * 64)
+                )
+            changes = checker.update_manifests()
+            return checker, changes
+
+        _, messages = observe(["2", "5"])
+        old = json.loads(root.read_text())
+        current, _ = observe(["3", "5"])
+        self.assertTrue(
+            current.covers_legacy_update(
+                {root.name}, messages, old, later_observation=False
+            )
+        )
+        old["sources"][1]["sha256"] = "a" * 64
+        self.assertFalse(
+            current.covers_legacy_update(
+                {root.name}, messages, old, later_observation=False
+            )
+        )
 
     def test_update_appdata_no_main_source(self):
         with open(self.mf_path, "w") as f:
@@ -511,6 +569,45 @@ class TestManifest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(changes), 1)
         self.assertEqual(len(checker.source_updates), 1)
         self.assertIsInstance(checker.get_errors()[0], AppdataError)
+
+    def test_replacement_must_cover_old_appstream_update(self):
+        root = Path(self.mf_path)
+        appdata = root.with_name("org.test.App.appdata.xml")
+        original = {
+            "id": "org.test.App",
+            "modules": [
+                {
+                    "name": "mod",
+                    "sources": [
+                        {
+                            "type": "file",
+                            "url": "https://example.org/file",
+                            "sha256": "c",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        def observe(version, xml):
+            root.write_text(json.dumps(original))
+            appdata.write_text(xml)
+            checker = manifest.ManifestChecker(self.mf_path)
+            checker._repository = root.parent
+            data = checker.get_external_data()[0]
+            data.new_version = data.current_version._replace(
+                url=f"https://example.org/file-{version}",
+                version=version,
+                checksum=MultiDigest(sha256=version * 64),
+            )
+            with patch.object(checker, "_find_repository", return_value=root.parent):
+                checker.update_manifests()
+            return checker.pr_targets
+
+        head = "a" * 40
+        old = replacement_marker(head, observe("2", "<component/>"))
+        self.assertFalse(supersedes(old, head, observe("3", "<component>")))
+        self.assertTrue(supersedes(old, head, observe("3", "<component/>")))
 
 
 if __name__ == "__main__":

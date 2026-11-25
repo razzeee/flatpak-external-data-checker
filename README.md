@@ -195,12 +195,15 @@ After opening a replacement PR, the checker closes older PRs from the same
 account and head repository targeting the same base branch if the replacement
 covers every source update and advances at least one numeric release version
 or observes new content at an unversioned rotating URL. Unrelated commits on
-the base branch do not prevent replacement. The checker links to the new PR,
+the base branch do not invalidate source matches in PRs with replacement
+metadata. If an older PR includes an AppStream release, the replacement must
+also update it. The checker links to the new PR in the old PR's description,
 keeps the old branch, and retries a failed close when it finds the replacement
 on a later run.
 
 For older PRs without replacement metadata, the checker compares the original
-checker commit's update messages and changed files. It keeps PRs open if
+checker commit's update messages, manifest contents, and changed files.
+It keeps PRs open if
 coverage is uncertain, including partial architecture updates with identical
 commit messages, submodule updates, and PRs with additional commits.
 

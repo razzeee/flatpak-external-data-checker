@@ -156,6 +156,8 @@ class TestCloseSuperseded(PublicationFixture):
         self.new.base.ref = "master"
         self.new.head.sha = "b" * 40
         self.checker = MagicMock()
+        self.checker.root_manifest_file = "app.yaml"
+        self.checker.opts.max_manifest_size = 1024
         self.checker.check_started = self.old.created_at + datetime.timedelta(days=1)
         self.checker.pr_targets = {self.key: Target("rotating", "3" * 64)}
 
@@ -173,8 +175,9 @@ class TestCloseSuperseded(PublicationFixture):
         self.repo.get_pulls.side_effect = [[self.new], [self.old]]
         self.publish()
         self.assertEqual(self.old.edit.call_count, 2)
-        self.old.create_issue_comment.assert_called_once_with(
-            f"Superseded by {self.new.html_url}."
+        self.assertIn(
+            f"Superseded by {self.new.html_url}.",
+            self.old.edit.call_args.kwargs["body"],
         )
         self.repo.create_pull.assert_called_once()
 
@@ -206,14 +209,25 @@ class TestCloseSuperseded(PublicationFixture):
         commit.files = [MagicMock(filename="app.yaml", status="modified")]
         self.old.changed_files = 1
         self.repo.get_contents.return_value.sha = "f" * 40
+        self.repo.get_contents.return_value.size = 2
+        self.repo.get_contents.return_value.decoded_content = b"{}"
 
     def test_legacy_pr_across_unrelated_base_change(self):
         self.setup_legacy_pr()
         self.publish()
         self.checker.covers_legacy_update.assert_called_once_with(
-            {"app.yaml"}, ["foo: Update foo to 1.2"]
+            {"app.yaml"}, ["foo: Update foo to 1.2"], {}, later_observation=True
         )
-        self.old.edit.assert_called_once_with(state="closed")
+        self.assertEqual(self.old.edit.call_args.kwargs["state"], "closed")
+
+    def test_later_publication_of_older_numeric_release(self):
+        self.old.number = self.new.number + 1
+        self.old.body = replacement_marker(
+            self.old.head.sha, {self.key: Target("2.0", "2" * 64)}
+        )
+        self.checker.pr_targets = {self.key: Target("3.0", "3" * 64)}
+        self.publish()
+        self.assertEqual(self.old.edit.call_args.kwargs["state"], "closed")
 
     def test_legacy_pr_with_changed_manifest_base_is_kept(self):
         self.setup_legacy_pr()

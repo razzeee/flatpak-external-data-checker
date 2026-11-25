@@ -21,7 +21,6 @@
 import asyncio
 import dataclasses
 import datetime
-import hashlib
 import logging
 import os
 import subprocess
@@ -53,7 +52,7 @@ from .lib.externaldata import (
     BuilderModule,
     ExternalBase,
 )
-from .lib.prreplacement import Target, Targets, advances, fingerprint, release_version
+from .lib.prreplacement import Change, Target, Targets, fingerprint, release_version
 from .lib.robots import RobotsCache
 from .lib.sourceupdates import SourceUpdate
 from .lib.submodules import (
@@ -75,6 +74,17 @@ MAXIMUM_HEADER_SIZE = 65536
 
 
 log = logging.getLogger(__name__)
+
+
+def source_paths(node, path=(), seen=None):
+    """Find the first path to each container, visiting YAML aliases only once."""
+    if seen is None:
+        seen = set()
+    if isinstance(node, (dict, list)) and id(node) not in seen:
+        seen.add(id(node))
+        yield id(node), path
+        for key, child in node.items() if isinstance(node, dict) else enumerate(node):
+            yield from source_paths(child, (*path, key), seen)
 
 
 def find_appdata_file(directory, appid):
@@ -135,6 +145,8 @@ class ManifestChecker:
         self._errors = []
         self.source_updates: list[SourceUpdate] = []
         self._pr_targets: Targets = {}
+        self._source_baselines: dict[int, str] = {}
+        self._complete_pr_targets = True
         self._updated_appdata: str | None = None
         self.check_started = datetime.datetime.now(datetime.timezone.utc)
         self._allowed_updates: set[int] | None = None
@@ -882,22 +894,32 @@ class ManifestChecker:
 
     @property
     def pr_targets(self) -> Targets:
-        return (
-            self._pr_targets
-            if len(self._pr_targets) == len(self.source_updates)
-            else {}
-        )
+        return self._pr_targets if self._complete_pr_targets else {}
 
-    def covers_legacy_update(self, files: set[str], messages: list[str]) -> bool:
+    @property
+    def root_manifest_file(self) -> str:
+        assert self._repository
+        return os.path.relpath(self._root_manifest_path, self._repository)
+
+    def covers_legacy_update(
+        self,
+        files: set[str],
+        messages: list[str],
+        old_manifest,
+        *,
+        later_observation: bool,
+    ) -> bool:
         """Legacy commit messages omit architectures. Cover every matching source."""
         if not self._repository or not files or not messages:
             return False
-        root = os.path.relpath(self._root_manifest_path, self._repository)
+        root = self.root_manifest_file
         expected_files = {root}
         if self._updated_appdata:
             expected_files.add(os.path.relpath(self._updated_appdata, self._repository))
         if root not in files or not files <= expected_files:
             return False
+        paths = dict(source_paths(self._manifest_contents[self._root_manifest_path]))
+        newer = False
         for message in messages:
             label, separator, version = message.rpartition(" to ")
             if not separator:
@@ -916,14 +938,36 @@ class ManifestChecker:
                     or data.new_version is None
                 ):
                     return False
-                if not advances(release_version(data), version):
+                old_source = old_manifest
+                for step in paths[id(data.source)]:
+                    if isinstance(old_source, dict) and step in old_source:
+                        old_source = old_source[step]
+                    elif (
+                        isinstance(old_source, list)
+                        and isinstance(step, int)
+                        and step < len(old_source)
+                    ):
+                        old_source = old_source[step]
+                    else:
+                        return False
+                if not isinstance(old_source, dict):
                     return False
-        return True
+                if fingerprint(old_source) == self._source_baselines.get(id(data)):
+                    continue
+                current = Target.from_manifest_source(
+                    release_version(data), data.source
+                )
+                previous = Target.from_manifest_source(version, old_source)
+                change = current.compare(previous, later_observation=later_observation)
+                if change is Change.INCOMPARABLE:
+                    return False
+                newer |= change is Change.NEWER
+        return newer
 
     def _update_manifest(self, path, datas, changes):
         path_has_changes = False
-        baseline = None
-        for index, data in enumerate(datas):
+        paths = None
+        for data in datas:
             if not self._can_update(data):
                 continue
 
@@ -933,15 +977,16 @@ class ManifestChecker:
 
             source_update = SourceUpdate.from_source(data)
             if self._repository:
-                if baseline is None:
-                    baseline = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                if paths is None:
+                    paths = dict(source_paths(self._manifest_contents[path]))
                 key = fingerprint(
-                    os.path.relpath(self._root_manifest_path, self._repository),
+                    self.root_manifest_file,
                     os.path.relpath(path, self._repository),
-                    index,
-                    baseline,
+                    paths[id(data.source)],
+                    data.source,
                 )
                 self._pr_targets[key] = Target.from_source(data)
+                self._source_baselines[id(data)] = fingerprint(data.source)
             data.update()
             self.source_updates.append(source_update)
             if data_new_ver_version is not None:
@@ -1030,6 +1075,14 @@ class ManifestChecker:
                     release_url=selected_data.new_release_url,
                 )
                 self._updated_appdata = appdata
+                if self._repository:
+                    key = fingerprint(
+                        "appstream",
+                        self.root_manifest_file,
+                        os.path.relpath(appdata, self._repository),
+                        str(selected_data),
+                    )
+                    self._pr_targets[key] = Target("unknown", fingerprint("release"))
             except XMLSyntaxError as err:
                 raise AppdataLoadError from err
         else:
@@ -1047,6 +1100,8 @@ class ManifestChecker:
         changes = OrderedDict()
         self.source_updates = []
         self._pr_targets = {}
+        self._source_baselines = {}
+        self._complete_pr_targets = True
         self._updated_appdata = None
         planned = self.get_planned_updates(allowed)
         self._allowed_updates = {id(data) for data in planned}
@@ -1070,6 +1125,7 @@ class ManifestChecker:
 
         for update in submodule_updates:
             if self.submodule_checker.apply(update):
+                self._complete_pr_targets = False
                 changes[
                     f"Update submodule {update.path} to {update.candidate[:12]}"
                 ] = None

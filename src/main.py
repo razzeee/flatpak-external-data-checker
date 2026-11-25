@@ -382,6 +382,21 @@ def same_base_file(repo: Repository, path: str, left: str, right: str) -> bool:
     )
 
 
+def previous_manifest(repo: Repository, checker: manifest.ManifestChecker, head: str):
+    blob = repo.get_contents(checker.root_manifest_file, ref=head)
+    if isinstance(blob, list) or blob.size > checker.opts.max_manifest_size:
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / Path(checker.root_manifest_file).name
+        try:
+            path.write_bytes(blob.decoded_content)
+            contents = read_manifest(path)
+        except Exception:
+            log.warning("Could not read previous manifest at %s", head, exc_info=True)
+            return None
+    return contents[0] if isinstance(contents, tuple) else contents
+
+
 def close_superseded(
     repo: Repository,
     replacement: PullRequest,
@@ -391,15 +406,20 @@ def close_superseded(
 ) -> None:
     for old in candidates:
         try:
-            if (
-                old.number >= replacement.number
-                or old.user.id != replacement.user.id
-                or old.created_at >= checker.check_started
-            ):
+            if old.number == replacement.number or old.user.id != replacement.user.id:
                 continue
+            later_observation = (
+                old.number < replacement.number
+                and old.created_at < checker.check_started
+            )
             body = old.body or ""
             if MARKER in body:
-                if not supersedes(body, old.head.sha, checker.pr_targets):
+                if not supersedes(
+                    body,
+                    old.head.sha,
+                    checker.pr_targets,
+                    later_observation=later_observation,
+                ):
                     continue
             else:
                 if DISCLAIMER not in body or old.commits != 1:
@@ -416,12 +436,17 @@ def close_superseded(
                 if (
                     len(files) != old.changed_files
                     or subject != commit_message(messages)
-                    or not checker.covers_legacy_update(files, messages)
+                    or checker.root_manifest_file not in files
                 ):
                     continue
                 previous_base = commit.parents[0].sha
                 if previous_base != parent and not all(
                     same_base_file(repo, path, previous_base, parent) for path in files
+                ):
+                    continue
+                previous = previous_manifest(repo, checker, old.head.sha)
+                if previous is None or not checker.covers_legacy_update(
+                    files, messages, previous, later_observation=later_observation
                 ):
                     continue
             current = repo.get_pull(old.number)
@@ -432,8 +457,9 @@ def close_superseded(
                 or current.body != old.body
             ):
                 continue
-            current.edit(state="closed")
-            current.create_issue_comment(f"Superseded by {replacement.html_url}.")
+            body = f"{body}\n\nSuperseded by {replacement.html_url}."
+            if len(body) <= 65536:
+                current.edit(state="closed", body=body)
         except GithubException:
             log.warning(
                 "Could not finish superseding PR %s", old.html_url, exc_info=True
@@ -607,13 +633,13 @@ def open_pr(
             if targets and (MARKER in (pr.body or "") or DISCLAIMER in (pr.body or "")):
                 candidates.append(pr)
 
-    revision = (
-        subprocess.check_output(
+    head_sha = parent_sha = ""
+    if targets:
+        match subprocess.check_output(
             ["git", "rev-list", "--parents", "-1", "HEAD"], text=True
-        ).split()
-        if targets
-        else []
-    )
+        ).split():
+            case [head_sha, parent_sha]:
+                pass
     for pr in open_prs:
         if report is not None:
             report["pull_request"] = {
@@ -624,10 +650,10 @@ def open_pr(
         if (
             candidates
             and manifest_checker
-            and len(revision) == 2
+            and parent_sha
             and replacement_marker(pr.head.sha, targets) in (pr.body or "")
         ):
-            close_superseded(origin_repo, pr, candidates, manifest_checker, revision[1])
+            close_superseded(origin_repo, pr, candidates, manifest_checker, parent_sha)
 
         if automerge or force_automerge:
             pr_commit = pr.head.repo.get_commit(pr.head.sha)
@@ -711,8 +737,8 @@ def open_pr(
     if base != origin_repo.default_branch:
         subject = f"[{base}] {subject}"
 
-    if len(revision) == 2:
-        body = pr_message + "\n\n" + replacement_marker(revision[0], targets)
+    if parent_sha:
+        body = pr_message + "\n\n" + replacement_marker(head_sha, targets)
         if len(body) <= 65536:  # GitHub's PR body limit
             pr_message = body
 
@@ -729,8 +755,8 @@ def open_pr(
     if pr_labels:
         log.info("Adding labels to PR: %s", ", ".join(pr_labels))
         pr.set_labels(*pr_labels)
-    if candidates and manifest_checker and len(revision) == 2 and MARKER in pr_message:
-        close_superseded(origin_repo, pr, candidates, manifest_checker, revision[1])
+    if candidates and manifest_checker and parent_sha and MARKER in pr_message:
+        close_superseded(origin_repo, pr, candidates, manifest_checker, parent_sha)
     return True
 
 
