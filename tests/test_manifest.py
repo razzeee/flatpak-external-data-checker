@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import aiohttp
@@ -12,6 +13,7 @@ from src.checkers.gitchecker import GitChecker
 from src.lib.checksums import MultiDigest
 from src.lib.errors import AppdataError
 from src.lib.externaldata import ExternalFile
+from src.lib.prreplacement import replacement_marker, supersedes
 
 
 class TestManifest(unittest.IsolatedAsyncioTestCase):
@@ -340,6 +342,52 @@ class TestManifest(unittest.IsolatedAsyncioTestCase):
         checker = manifest.ManifestChecker(self.mf_path)
         with self.assertRaises(manifest.AppdataNotFound):
             checker._update_appdata()
+
+    def test_rotating_checksums_cover_both_architectures(self):
+        path = Path(self.mf_path)
+        original = json.dumps(
+            {
+                "name": "scanner",
+                "sources": [
+                    {
+                        "type": "extra-data",
+                        "filename": "scanner.tgz",
+                        "size": 1,
+                        "only-arches": [arch],
+                        "sha256": "a" * 64,
+                        "url": f"https://example.org/{arch}.tgz",
+                        "x-checker-data": {
+                            "type": "rotating-url",
+                            "url": f"https://example.org/{arch}.tgz",
+                        },
+                    }
+                    for arch in ("x86_64", "aarch64")
+                ],
+            }
+        )
+
+        def observe(digests):
+            path.write_text(original)
+            checker = manifest.ManifestChecker(self.mf_path)
+            checker._repository = path.parent
+            for data, digest in zip(checker.get_external_data(), digests, strict=False):
+                data.new_version = data.current_version._replace(
+                    checksum=MultiDigest(sha256=digest * 64)
+                )
+            checker.update_manifests()
+            return checker
+
+        head = "a" * 40
+        previous = observe(["b", "c"])
+        body = replacement_marker(head, previous.pr_targets)
+        Path(path.parent, "README.md").write_text("Other changes")
+        current = observe(["b", "d"])
+        self.assertTrue(supersedes(body, head, current.pr_targets))
+        legacy = ["scanner: Update scanner.tgz"]
+        self.assertTrue(current.covers_legacy_update({path.name}, legacy))
+        partial = observe(["d"])
+        self.assertFalse(supersedes(body, head, partial.pr_targets))
+        self.assertFalse(partial.covers_legacy_update({path.name}, legacy))
 
     def test_source_updates_keep_each_architecture_and_respect_gate(self):
         with open(self.mf_path, "w") as f:

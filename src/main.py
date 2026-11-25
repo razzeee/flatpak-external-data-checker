@@ -39,12 +39,14 @@ from enum import IntFlag
 from pathlib import Path
 
 from github import Github, GithubException
+from github.PullRequest import PullRequest
+from github.Repository import Repository
 
 from . import manifest
 from .lib.errors import ManifestLoadError
 from .lib.externaldata import ExternalData
 from .lib.provenance import checker_provenance
-from .lib.prreplacement import Targets, fingerprint, replacement_marker, supersedes
+from .lib.prreplacement import MARKER, replacement_marker, supersedes
 from .lib.runtime import RuntimeEolChecker
 from .lib.sourceupdates import format_source_updates
 from .lib.utils import init_logging, parse_github_url, read_manifest
@@ -370,6 +372,74 @@ AUTOMERGE_DUE_TO_BROKEN_URLS = (
 )
 
 
+def same_base_file(repo: Repository, path: str, left: str, right: str) -> bool:
+    first = repo.get_contents(path, ref=left)
+    second = repo.get_contents(path, ref=right)
+    return (
+        not isinstance(first, list)
+        and not isinstance(second, list)
+        and first.sha == second.sha
+    )
+
+
+def close_superseded(
+    repo: Repository,
+    replacement: PullRequest,
+    candidates: list[PullRequest],
+    checker: manifest.ManifestChecker,
+    parent: str,
+) -> None:
+    for old in candidates:
+        try:
+            if (
+                old.number >= replacement.number
+                or old.user.id != replacement.user.id
+                or old.created_at >= checker.check_started
+            ):
+                continue
+            body = old.body or ""
+            if MARKER in body:
+                if not supersedes(body, old.head.sha, checker.pr_targets):
+                    continue
+            else:
+                if DISCLAIMER not in body or old.commits != 1:
+                    continue
+                commit = repo.get_commit(old.head.sha)
+                if (
+                    not old.head.ref.endswith("-" + commit.commit.tree.sha[:7])
+                    or len(commit.parents) != 1
+                ):
+                    continue
+                subject, _, details = commit.commit.message.strip().partition("\n\n")
+                messages = details.splitlines() if details else [subject]
+                files = {f.filename for f in commit.files if f.status == "modified"}
+                if (
+                    len(files) != old.changed_files
+                    or subject != commit_message(messages)
+                    or not checker.covers_legacy_update(files, messages)
+                ):
+                    continue
+                previous_base = commit.parents[0].sha
+                if previous_base != parent and not all(
+                    same_base_file(repo, path, previous_base, parent) for path in files
+                ):
+                    continue
+            current = repo.get_pull(old.number)
+            if (
+                current.state != "open"
+                or current.base.ref != replacement.base.ref
+                or current.head.sha != old.head.sha
+                or current.body != old.body
+            ):
+                continue
+            current.edit(state="closed")
+            current.create_issue_comment(f"Superseded by {replacement.html_url}.")
+        except GithubException:
+            log.warning(
+                "Could not finish superseding PR %s", old.html_url, exc_info=True
+            )
+
+
 def open_pr(
     change: CommittedChanges,
     manifest_checker: manifest.ManifestChecker | None = None,
@@ -515,8 +585,9 @@ def open_pr(
         return True
 
     open_prs = [pr for pr in prs if pr.state == "open"]
-    candidates = []
-    if not open_prs:
+    candidates: list[PullRequest] = []
+    targets = manifest_checker.pr_targets if manifest_checker is not None else {}
+    if not open_prs or (targets and MARKER in (open_prs[0].body or "")):
         # Merging the base branch changes a PR's tree but not its branch name.
         update_branch = re.compile(rf"update-(?:{re.escape(base)}-)?[0-9a-f]{{7}}")
         for pr in origin_repo.get_pulls(state="open", base=base):
@@ -526,13 +597,23 @@ def open_pr(
                 or not update_branch.fullmatch(pr.head.ref)
             ):
                 continue
-            pr_commit = pr.head.repo.get_commit(pr.head.sha)
-            if pr_commit.commit.tree.sha == change.commit:
-                open_prs.append(pr)
-                break
-            if pr.body and "<!-- fedc-updates-v1 " in pr.body:
+            if not open_prs:
+                pr_commit = pr.head.repo.get_commit(pr.head.sha)
+                if pr_commit.commit.tree.sha == change.commit:
+                    open_prs.append(pr)
+                    if not targets:
+                        break
+                    continue
+            if targets and (MARKER in (pr.body or "") or DISCLAIMER in (pr.body or "")):
                 candidates.append(pr)
 
+    revision = (
+        subprocess.check_output(
+            ["git", "rev-list", "--parents", "-1", "HEAD"], text=True
+        ).split()
+        if targets
+        else []
+    )
     for pr in open_prs:
         if report is not None:
             report["pull_request"] = {
@@ -540,6 +621,13 @@ def open_pr(
                 "outcome": "existing_open",
             }
         log.info("Found open PR: %s", pr.html_url)
+        if (
+            candidates
+            and manifest_checker
+            and len(revision) == 2
+            and replacement_marker(pr.head.sha, targets) in (pr.body or "")
+        ):
+            close_superseded(origin_repo, pr, candidates, manifest_checker, revision[1])
 
         if automerge or force_automerge:
             pr_commit = pr.head.repo.get_commit(pr.head.sha)
@@ -623,28 +711,10 @@ def open_pr(
     if base != origin_repo.default_branch:
         subject = f"[{base}] {subject}"
 
-    targets: Targets = {}
-    if (
-        manifest_checker
-        and manifest_checker.pr_targets
-        and len(manifest_checker.pr_targets) == len(manifest_checker.source_updates)
-    ):
-        # Bind positional source IDs to the exact manifest revision they came from.
-        revision = subprocess.check_output(
-            ["git", "rev-list", "--parents", "-1", "HEAD"], text=True
-        ).split()
-        if len(revision) == 2:
-            original_head, parent = revision
-            scoped_targets = {
-                fingerprint(parent, key): target
-                for key, target in manifest_checker.pr_targets.items()
-            }
-            body = (
-                pr_message + "\n\n" + replacement_marker(original_head, scoped_targets)
-            )
-            if len(body) <= 65536:  # GitHub's PR body limit
-                pr_message = body
-                targets = scoped_targets
+    if len(revision) == 2:
+        body = pr_message + "\n\n" + replacement_marker(revision[0], targets)
+        if len(body) <= 65536:  # GitHub's PR body limit
+            pr_message = body
 
     pr = origin_repo.create_pull(
         title=subject,
@@ -659,28 +729,8 @@ def open_pr(
     if pr_labels:
         log.info("Adding labels to PR: %s", ", ".join(pr_labels))
         pr.set_labels(*pr_labels)
-    for old in candidates:
-        if (
-            targets
-            and old.user.id == pr.user.id
-            and supersedes(old.body, old.head.sha, targets)
-        ):
-            try:
-                # A maintainer may have pushed or retargeted the PR during publication.
-                current = origin_repo.get_pull(old.number)
-                if (
-                    current.state != "open"
-                    or current.base.ref != base
-                    or current.head.sha != old.head.sha
-                    or current.body != old.body
-                ):
-                    continue
-                old.edit(state="closed")
-                old.create_issue_comment(f"Superseded by {pr.html_url}.")
-            except GithubException:
-                log.warning(
-                    "Could not finish superseding PR %s", old.html_url, exc_info=True
-                )
+    if candidates and manifest_checker and len(revision) == 2 and MARKER in pr_message:
+        close_superseded(origin_repo, pr, candidates, manifest_checker, revision[1])
     return True
 
 

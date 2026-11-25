@@ -193,10 +193,16 @@ with access to the target repository.
 
 After opening a replacement PR, the checker closes older PRs from the same
 account and head repository targeting the same base branch if the replacement
-covers every source update and advances at least one numeric release version.
-It links to the replacement and keeps the old branch. PRs based on a different
-commit, PRs with additional commits, and PRs without the checker's replacement
-metadata (including submodule updates) stay open.
+covers every source update and advances at least one numeric release version
+or observes new content at an unversioned rotating URL. Unrelated commits on
+the base branch do not prevent replacement. The checker links to the new PR,
+keeps the old branch, and retries a failed close when it finds the replacement
+on a later run.
+
+For older PRs without replacement metadata, the checker compares the original
+checker commit's update messages and changed files. It keeps PRs open if
+coverage is uncertain, including partial architecture updates with identical
+commit messages, submodule updates, and PRs with additional commits.
 
 ### Selectively submitting PRs
 

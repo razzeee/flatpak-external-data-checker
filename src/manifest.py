@@ -21,6 +21,7 @@
 import asyncio
 import dataclasses
 import datetime
+import hashlib
 import logging
 import os
 import subprocess
@@ -52,7 +53,7 @@ from .lib.externaldata import (
     BuilderModule,
     ExternalBase,
 )
-from .lib.prreplacement import Targets, fingerprint, release_version
+from .lib.prreplacement import Target, Targets, advances, fingerprint, release_version
 from .lib.robots import RobotsCache
 from .lib.sourceupdates import SourceUpdate
 from .lib.submodules import (
@@ -133,7 +134,9 @@ class ManifestChecker:
         self._errors: list[Exception]
         self._errors = []
         self.source_updates: list[SourceUpdate] = []
-        self.pr_targets: Targets = {}
+        self._pr_targets: Targets = {}
+        self._updated_appdata: str | None = None
+        self.check_started = datetime.datetime.now(datetime.timezone.utc)
         self._allowed_updates: set[int] | None = None
         self._blocked_update_sources: set[int] = set()
         self._source_checks: dict[int, list[str]] = {}
@@ -877,8 +880,49 @@ class ManifestChecker:
                 return []
         return updates
 
+    @property
+    def pr_targets(self) -> Targets:
+        return (
+            self._pr_targets
+            if len(self._pr_targets) == len(self.source_updates)
+            else {}
+        )
+
+    def covers_legacy_update(self, files: set[str], messages: list[str]) -> bool:
+        """Legacy commit messages omit architectures. Cover every matching source."""
+        if not self._repository or not files or not messages:
+            return False
+        root = os.path.relpath(self._root_manifest_path, self._repository)
+        expected_files = {root}
+        if self._updated_appdata:
+            expected_files.add(os.path.relpath(self._updated_appdata, self._repository))
+        if root not in files or not files <= expected_files:
+            return False
+        for message in messages:
+            label, separator, version = message.rpartition(" to ")
+            if not separator:
+                label, version = message, "rotating"
+            sources = [
+                data
+                for data in self.get_external_data()
+                if f"{data.module}: Update {data.filename}" == label
+            ]
+            if not sources:
+                return False
+            for data in sources:
+                if (
+                    data.source_path != self._root_manifest_path
+                    or not self._can_update(data)
+                    or data.new_version is None
+                ):
+                    return False
+                if not advances(release_version(data), version):
+                    return False
+        return True
+
     def _update_manifest(self, path, datas, changes):
         path_has_changes = False
+        baseline = None
         for index, data in enumerate(datas):
             if not self._can_update(data):
                 continue
@@ -889,16 +933,15 @@ class ManifestChecker:
 
             source_update = SourceUpdate.from_source(data)
             if self._repository:
+                if baseline is None:
+                    baseline = hashlib.sha256(Path(path).read_bytes()).hexdigest()
                 key = fingerprint(
                     os.path.relpath(self._root_manifest_path, self._repository),
                     os.path.relpath(path, self._repository),
                     index,
-                    source_update.source,
+                    baseline,
                 )
-                self.pr_targets[key] = (
-                    release_version(data_new_ver_version),
-                    fingerprint(data.new_version.json),
-                )
+                self._pr_targets[key] = Target.from_source(data)
             data.update()
             self.source_updates.append(source_update)
             if data_new_ver_version is not None:
@@ -986,6 +1029,7 @@ class ManifestChecker:
                     release_url_template,
                     release_url=selected_data.new_release_url,
                 )
+                self._updated_appdata = appdata
             except XMLSyntaxError as err:
                 raise AppdataLoadError from err
         else:
@@ -1002,7 +1046,8 @@ class ManifestChecker:
         changes: dict[str, t.Any]
         changes = OrderedDict()
         self.source_updates = []
-        self.pr_targets = {}
+        self._pr_targets = {}
+        self._updated_appdata = None
         planned = self.get_planned_updates(allowed)
         self._allowed_updates = {id(data) for data in planned}
         submodule_updates = (
